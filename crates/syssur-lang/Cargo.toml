@@ -1,0 +1,10 @@
+[package]
+name = "syssur-lang"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+syssur-model = { workspace = true }
+sysmlv2-syntax = { workspace = true }
+sysmlv2-model = { workspace = true }

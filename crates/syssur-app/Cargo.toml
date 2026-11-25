@@ -1,0 +1,28 @@
+[package]
+name = "syssur-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+syssur-model = { workspace = true }
+syssur-lang = { workspace = true }
+syssur-layout = { workspace = true }
+syssur-cmd = { workspace = true }
+syssur-collab = { workspace = true }
+egui = { workspace = true }
+eframe = { workspace = true }
+egui_dock = { workspace = true }
+ewebsock = { workspace = true }
+rstar = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rfd = "0.15"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+log = "0.4"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Blob", "BlobPropertyBag", "Document", "Element", "HtmlAnchorElement", "Url", "Window"] }

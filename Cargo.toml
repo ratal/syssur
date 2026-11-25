@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/syssur-model",
+    "crates/syssur-lang",
+    "crates/syssur-layout",
+    "crates/syssur-cmd",
+    "crates/syssur-collab",
+    "crates/syssur-store",
+    "crates/syssur-server",
+    "crates/syssur-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+syssur-model = { path = "crates/syssur-model" }
+syssur-lang = { path = "crates/syssur-lang" }
+syssur-layout = { path = "crates/syssur-layout" }
+syssur-cmd = { path = "crates/syssur-cmd" }
+syssur-collab = { path = "crates/syssur-collab" }
+syssur-store = { path = "crates/syssur-store" }
+
+sysmlv2-syntax = { git = "https://github.com/Open-MBEE/sysml-toolkit.git", rev = "c8d256bdf6638d3f867e61850df332da43a0f9e9" }
+sysmlv2-model = { git = "https://github.com/Open-MBEE/sysml-toolkit.git", rev = "c8d256bdf6638d3f867e61850df332da43a0f9e9" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures-util = "0.3"
+loro = "1.19"
+dagre = "0.1.2"
+rstar = "0.14"
+egui = { version = "0.37", features = ["default_fonts"] }
+eframe = "0.37"
+egui_dock = "0.22"
+ewebsock = "0.8"
+axum = { version = "0.8", features = ["ws"] }
+sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio"] }
