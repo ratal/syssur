@@ -4,7 +4,7 @@
 //! Shared across the right-click diagram context menu, the Model Explorer creation
 //! menus, and the optional toggleable palette drawer.
 
-use egui::{RichText, ScrollArea, TextEdit, Ui};
+use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextEdit, Ui, Vec2};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CatalogCategory {
@@ -924,6 +924,261 @@ pub fn catalog_relationships() -> impl Iterator<Item = &'static SysmlCatalogItem
     SYSML_V2_CATALOG.iter().filter(|item| item.is_relationship)
 }
 
+fn category_accent(cat: CatalogCategory, keyword: &str) -> Color32 {
+    match cat {
+        CatalogCategory::NamespacesAndAnnotations => Color32::from_rgb(160, 175, 200),
+        CatalogCategory::Structure => Color32::from_rgb(125, 185, 240),
+        CatalogCategory::PortsAndInterfaces => {
+            if keyword == "~port" {
+                Color32::from_rgb(245, 165, 95)
+            } else {
+                Color32::from_rgb(110, 205, 245)
+            }
+        }
+        CatalogCategory::ActionsAndControl => Color32::from_rgb(92, 195, 185),
+        CatalogCategory::StatesAndTransitions => Color32::from_rgb(180, 140, 245),
+        CatalogCategory::CalcConstraintsRequirements => Color32::from_rgb(235, 185, 85),
+        CatalogCategory::CasesAndVerification => Color32::from_rgb(145, 185, 245),
+        CatalogCategory::ViewsAndMetadata => Color32::from_rgb(165, 175, 225),
+        CatalogCategory::Relationships => Color32::from_rgb(135, 210, 175),
+    }
+}
+
+/// Paints a compact SysML v2 graphical icon inside `rect` (recommended 13x13 or 14x14).
+pub fn paint_catalog_icon(painter: &egui::Painter, rect: Rect, item: &SysmlCatalogItem) {
+    paint_kind_icon(
+        painter,
+        rect,
+        item.category,
+        item.keyword,
+        item.is_def,
+        item.is_relationship,
+    );
+}
+
+/// Paints a compact SysML v2 graphical icon for any element category/keyword/definition flag.
+pub fn paint_kind_icon(
+    painter: &egui::Painter,
+    rect: Rect,
+    category: CatalogCategory,
+    keyword: &str,
+    is_def: bool,
+    is_relationship: bool,
+) {
+    let accent = category_accent(category, keyword);
+    let fill = Color32::from_rgb(30, 36, 46);
+    let stroke = Stroke::new(1.2, accent);
+    let c = rect.center();
+
+    if is_relationship {
+        let p0 = Pos2::new(rect.left() + 1.5, rect.bottom() - 2.5);
+        let p1 = Pos2::new(rect.right() - 1.5, rect.top() + 2.5);
+        let dashed = matches!(
+            keyword,
+            "satisfy" | "verify" | "dependency" | "succession" | "guarded_succession"
+        );
+        if dashed {
+            let mid = Pos2::new((p0.x + p1.x) * 0.5, (p0.y + p1.y) * 0.5);
+            painter.line_segment([p0, p0.lerp(mid, 0.7)], stroke);
+            painter.line_segment([mid.lerp(p1, 0.2), p1], stroke);
+        } else {
+            painter.line_segment([p0, p1], stroke);
+        }
+        let dir = (p1 - p0).normalized();
+        let perp = Vec2::new(-dir.y, dir.x);
+        match keyword {
+            "connection" | "interface" => {
+                painter.circle_filled(p0, 1.8, accent);
+                painter.circle_filled(p1, 1.8, accent);
+            }
+            "binding" => {
+                painter.text(
+                    c,
+                    Align2::CENTER_CENTER,
+                    "=",
+                    FontId::monospace(10.5),
+                    accent,
+                );
+            }
+            "specialization" => {
+                let a = p1 - dir * 5.0 + perp * 3.0;
+                let b = p1 - dir * 5.0 - perp * 3.0;
+                painter.add(egui::Shape::convex_polygon(
+                    vec![p1, a, b],
+                    Color32::from_rgb(20, 24, 30),
+                    Stroke::new(1.1, accent),
+                ));
+            }
+            "flow" => {
+                let a = p1 - dir * 5.0 + perp * 3.0;
+                let b = p1 - dir * 5.0 - perp * 3.0;
+                painter.add(egui::Shape::convex_polygon(
+                    vec![p1, a, b],
+                    accent,
+                    Stroke::NONE,
+                ));
+            }
+            _ => {
+                let a = p1 - dir * 4.5 + perp * 3.0;
+                let b = p1 - dir * 4.5 - perp * 3.0;
+                painter.line_segment([p1, a], stroke);
+                painter.line_segment([p1, b], stroke);
+            }
+        }
+        return;
+    }
+
+    match keyword {
+        "package" | "library package" => {
+            let tab = Rect::from_min_max(
+                Pos2::new(rect.left() + 1.5, rect.top() + 2.0),
+                Pos2::new(rect.left() + 7.0, rect.top() + 4.5),
+            );
+            let body = Rect::from_min_max(
+                Pos2::new(rect.left() + 1.5, rect.top() + 4.0),
+                Pos2::new(rect.right() - 1.5, rect.bottom() - 2.0),
+            );
+            painter.rect_filled(tab, CornerRadius::ZERO, accent.linear_multiply(0.35));
+            painter.rect_stroke(tab, CornerRadius::ZERO, stroke, StrokeKind::Inside);
+            painter.rect_filled(body, CornerRadius::ZERO, fill);
+            painter.rect_stroke(body, CornerRadius::ZERO, stroke, StrokeKind::Inside);
+        }
+        "port" | "~port" => {
+            let r = rect.shrink(2.5);
+            painter.rect_filled(r, CornerRadius::same(1), fill);
+            painter.rect_stroke(r, CornerRadius::same(1), stroke, StrokeKind::Inside);
+            painter.line_segment(
+                [Pos2::new(c.x - 2.5, c.y), Pos2::new(c.x + 2.5, c.y)],
+                stroke,
+            );
+            if keyword == "~port" {
+                painter.line_segment(
+                    [Pos2::new(c.x - 2.0, c.y), Pos2::new(c.x, c.y - 2.0)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [Pos2::new(c.x - 2.0, c.y), Pos2::new(c.x, c.y + 2.0)],
+                    stroke,
+                );
+            } else {
+                painter.line_segment(
+                    [Pos2::new(c.x + 2.0, c.y), Pos2::new(c.x, c.y - 2.0)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [Pos2::new(c.x + 2.0, c.y), Pos2::new(c.x, c.y + 2.0)],
+                    stroke,
+                );
+            }
+        }
+        "start" => {
+            painter.circle_filled(c, 4.5, Color32::from_rgb(230, 238, 248));
+        }
+        "done" => {
+            painter.circle_stroke(c, 5.0, Stroke::new(1.3, Color32::from_rgb(230, 238, 248)));
+            painter.circle_filled(c, 2.7, Color32::from_rgb(230, 238, 248));
+        }
+        "terminate" => {
+            painter.line_segment(
+                [rect.left_top() + Vec2::splat(3.0), rect.right_bottom() - Vec2::splat(3.0)],
+                Stroke::new(1.5, accent),
+            );
+            painter.line_segment(
+                [rect.right_top() + Vec2::new(-3.0, 3.0), rect.left_bottom() + Vec2::new(3.0, -3.0)],
+                Stroke::new(1.5, accent),
+            );
+        }
+        "fork" | "join" => {
+            let bar = Rect::from_center_size(c, Vec2::new(rect.width() - 2.0, 3.0));
+            painter.rect_filled(bar, 1.0, Color32::from_rgb(225, 234, 246));
+        }
+        "decide" | "merge" => {
+            let r = 5.2;
+            let pts = vec![
+                Pos2::new(c.x, c.y - r),
+                Pos2::new(c.x + r, c.y),
+                Pos2::new(c.x, c.y + r),
+                Pos2::new(c.x - r, c.y),
+            ];
+            let dfill = if keyword == "merge" {
+                Color32::from_rgb(195, 215, 240)
+            } else {
+                fill
+            };
+            painter.add(egui::Shape::convex_polygon(pts, dfill, stroke));
+        }
+        "use case" | "analysis" | "verification" | "case" => {
+            let r = rect.shrink2(Vec2::new(1.0, 2.5));
+            painter.rect_filled(r, CornerRadius::same(6), fill);
+            painter.rect_stroke(r, CornerRadius::same(6), stroke, StrokeKind::Inside);
+        }
+        "comment" | "alias" | "import" | "filter" => {
+            let ch = match keyword {
+                "comment" => "/*",
+                "alias" => "::",
+                "import" => "->",
+                _ => "[]",
+            };
+            painter.text(c, Align2::CENTER_CENTER, ch, FontId::monospace(9.5), accent);
+        }
+        _ => {
+            let r = rect.shrink2(Vec2::new(1.5, 2.0));
+            let cr = if is_def {
+                CornerRadius::ZERO
+            } else {
+                CornerRadius::same(3)
+            };
+            painter.rect_filled(r, cr, fill);
+            painter.rect_stroke(r, cr, stroke, StrokeKind::Inside);
+            painter.line_segment(
+                [Pos2::new(r.left(), r.top() + 4.0), Pos2::new(r.right(), r.top() + 4.0)],
+                Stroke::new(1.0, accent.linear_multiply(0.7)),
+            );
+        }
+    }
+}
+
+/// Interactive catalog item row showing a SysML v2 vector icon + label (+ optional DnD payload).
+pub fn catalog_item_row(
+    ui: &mut Ui,
+    item: &'static SysmlCatalogItem,
+    selected: bool,
+    draggable: bool,
+) -> egui::Response {
+    let height = 20.0;
+    let width = ui.available_width().max(150.0);
+    let sense = if draggable {
+        Sense::click_and_drag()
+    } else {
+        Sense::click()
+    };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), sense);
+
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact_selectable(&resp, selected);
+        if selected || resp.hovered() || resp.is_pointer_button_down_on() {
+            ui.painter().rect_filled(rect, 3.0, visuals.bg_fill);
+        }
+        let icon_rect = Rect::from_min_size(
+            Pos2::new(rect.left() + 4.0, rect.center().y - 7.0),
+            Vec2::splat(14.0),
+        );
+        paint_catalog_icon(ui.painter(), icon_rect, item);
+        ui.painter().text(
+            Pos2::new(rect.left() + 23.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            item.label,
+            FontId::proportional(12.5),
+            visuals.text_color(),
+        );
+    }
+
+    if draggable {
+        resp.dnd_set_drag_payload(item);
+    }
+    resp.on_hover_text(item.doc_hint)
+}
+
 /// Renders clean, non-convoluted Clause 7 creation submenus (or a flat filtered list when searching).
 pub fn show_create_submenus(ui: &mut Ui, search_query: &str) -> Option<&'static SysmlCatalogItem> {
     let q = search_query.trim().to_ascii_lowercase();
@@ -934,7 +1189,7 @@ pub fn show_create_submenus(ui: &mut Ui, search_query: &str) -> Option<&'static 
             if item.label.to_ascii_lowercase().contains(&q)
                 || item.keyword.to_ascii_lowercase().contains(&q)
             {
-                if ui.button(format!("+ {}", item.label)).clicked() {
+                if catalog_item_row(ui, item, false, false).clicked() {
                     picked = Some(item);
                     ui.close();
                 }
@@ -945,16 +1200,12 @@ pub fn show_create_submenus(ui: &mut Ui, search_query: &str) -> Option<&'static 
 
     for cat in CatalogCategory::ALL_CREATE {
         ui.menu_button(cat.label(), |ui| {
-            ui.set_min_width(210.0);
+            ui.set_min_width(220.0);
             for item in SYSML_V2_CATALOG
                 .iter()
                 .filter(|i| !i.is_relationship && i.category == cat)
             {
-                if ui
-                    .button(item.label)
-                    .on_hover_text(item.doc_hint)
-                    .clicked()
-                {
+                if catalog_item_row(ui, item, false, false).clicked() {
                     picked = Some(item);
                     ui.close();
                 }
@@ -970,7 +1221,7 @@ pub fn show_optional_palette(
     search: &mut String,
     active_tool: &mut Option<&'static SysmlCatalogItem>,
 ) {
-    ui.set_width(176.0);
+    ui.set_width(184.0);
     ui.vertical(|ui| {
         if ui
             .selectable_label(active_tool.is_none(), "Select / Move")
@@ -980,7 +1231,7 @@ pub fn show_optional_palette(
         }
         ui.add(
             TextEdit::singleline(search)
-                .desired_width(164.0)
+                .desired_width(172.0)
                 .hint_text("Filter SysML v2..."),
         );
         ui.separator();
@@ -1005,22 +1256,16 @@ pub fn show_optional_palette(
                     if items.is_empty() {
                         continue;
                     }
-                    ui.collapsing(RichText::new(cat.label()).small().strong(), |ui| {
-                        for item in items {
-                            let selected = active_tool.is_some_and(|t| t.id == item.id);
-                            let resp = ui.dnd_drag_source(
-                                egui::Id::unique(("pal_tool", item.id)),
-                                item,
-                                |ui| {
-                                    ui.selectable_label(selected, item.label)
-                                        .on_hover_text(item.doc_hint)
-                                },
-                            );
-                            if resp.inner.clicked() {
-                                *active_tool = if selected { None } else { Some(item) };
+                    egui::CollapsingHeader::new(RichText::new(cat.label()).small().strong())
+                        .open((!q.is_empty()).then_some(true))
+                        .show(ui, |ui| {
+                            for item in items {
+                                let selected = active_tool.is_some_and(|t| t.id == item.id);
+                                if catalog_item_row(ui, item, selected, true).clicked() {
+                                    *active_tool = if selected { None } else { Some(item) };
+                                }
                             }
-                        }
-                    });
+                        });
                 }
             });
     });

@@ -12,7 +12,7 @@ mod inspector;
 mod io;
 
 use canvas::{CanvasAction, DiagramCanvas, NodeMeta, PortEndpoint};
-use catalog::{show_create_submenus, SysmlCatalogItem};
+use catalog::{paint_kind_icon, show_create_submenus, CatalogCategory, SysmlCatalogItem};
 use egui::{Color32, FontFamily, FontId, Id, RichText, ScrollArea, TextEdit, TextStyle, Ui, WidgetText};
 use egui_dock::{DockArea, DockState, Style, TabViewer};
 use ewebsock::{WsEvent, WsMessage, WsReceiver, WsSender};
@@ -118,11 +118,15 @@ struct ViewTabState {
     active_tool: Option<&'static SysmlCatalogItem>,
     base_input: LayoutInput,
     node_offsets: BTreeMap<String, Point2>,
+    node_size_overrides: BTreeMap<String, (f32, f32)>,
     port_overrides: BTreeMap<(String, String), PortPlacement>,
     layout: LayoutOutput,
     node_meta: BTreeMap<String, NodeMeta>,
     canvas: DiagramCanvas,
     needs_fit: bool,
+    startup_autolayout_pending: bool,
+    startup_stable_frames: u8,
+    last_fit_viewport: egui::Vec2,
 }
 
 impl ViewTabState {
@@ -138,20 +142,39 @@ impl ViewTabState {
             active_tool: None,
             base_input: LayoutInput::default(),
             node_offsets: BTreeMap::new(),
+            node_size_overrides: BTreeMap::new(),
             port_overrides: BTreeMap::new(),
             layout: LayoutOutput::default(),
             node_meta: BTreeMap::new(),
             canvas: DiagramCanvas::default(),
             needs_fit: true,
+            startup_autolayout_pending: true,
+            startup_stable_frames: 0,
+            last_fit_viewport: egui::Vec2::ZERO,
         }
     }
 
     fn recompute_layout_only(&mut self) {
-        self.layout = compute_layout_with_port_overrides(
-            &self.base_input,
-            &self.node_offsets,
-            &self.port_overrides,
-        );
+        if self.node_size_overrides.is_empty() {
+            self.layout = compute_layout_with_port_overrides(
+                &self.base_input,
+                &self.node_offsets,
+                &self.port_overrides,
+            );
+        } else {
+            let mut input = self.base_input.clone();
+            for node in &mut input.nodes {
+                if let Some(&(w, h)) = self.node_size_overrides.get(&node.path.canonical_key()) {
+                    node.width = w;
+                    node.height = h;
+                }
+            }
+            self.layout = compute_layout_with_port_overrides(
+                &input,
+                &self.node_offsets,
+                &self.port_overrides,
+            );
+        }
         self.canvas.rebuild_spatial_index(&self.layout);
     }
 }
@@ -796,6 +819,37 @@ impl SyssurApp {
             .unwrap_or_else(|| "Model".to_string())
     }
 
+    fn target_package_for_active_view(&self, fallback_file: &str) -> (String, String) {
+        if let Some(tab) = self.active_view_tab.and_then(|tid| self.view_tabs.get(&tid)) {
+            match &tab.scope {
+                ViewScope::AdHocRoot(root_id) => {
+                    if let Some(pkg) = self.graph.packages.get(root_id) {
+                        return (pkg.name.clone(), pkg.span.file.clone());
+                    }
+                }
+                ViewScope::SysmlView(vid) => {
+                    if let Some(view) = self.graph.views.get(vid) {
+                        for pat in &view.expose_patterns {
+                            let seg = pat
+                                .split("::")
+                                .next()
+                                .unwrap_or("")
+                                .trim()
+                                .trim_matches('\'');
+                            if let Some(pkg) = self.graph.packages.values().find(|p| p.name == seg) {
+                                return (pkg.name.clone(), pkg.span.file.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (
+            self.default_package_for_file(fallback_file),
+            fallback_file.to_string(),
+        )
+    }
+
     fn default_action_for_file(&self, file: &str) -> Option<(String, String)> {
         self.graph
             .actions
@@ -825,9 +879,10 @@ impl SyssurApp {
             "start" | "done" | "terminate" | "import" | "filter" => item.default_name.to_string(),
             _ => format!("{}{idx}", item.default_name),
         };
-        let pkg = container_name
-            .clone()
-            .unwrap_or_else(|| self.default_package_for_file(&file));
+        let (pkg, file) = match container_name.clone() {
+            Some(cn) => (cn, file),
+            None => self.target_package_for_active_view(&file),
+        };
 
         if let Some(view_kind) = item.keyword.strip_prefix("view:") {
             self.execute_command(SyssurCommand::CreateView {
@@ -901,11 +956,33 @@ impl SyssurApp {
             }
             "part" if item.is_def => {
                 self.execute_command(SyssurCommand::CreatePartDef {
-                    file,
+                    file: file.clone(),
                     package: pkg,
-                    name,
+                    name: name.clone(),
                     specializes: None,
                 });
+                let new_id = self
+                    .graph
+                    .part_defs
+                    .values()
+                    .find(|pd| pd.name == name && pd.span.file == file)
+                    .or_else(|| self.graph.part_defs.values().find(|pd| pd.name == name))
+                    .map(|pd| pd.id.clone());
+                if let Some(new_id) = new_id {
+                    self.selected_target = SelectedTarget::Element(new_id.clone());
+                    let visible_in_active = self
+                        .active_view_tab
+                        .and_then(|tid| self.view_tabs.get(&tid))
+                        .is_some_and(|tab| {
+                            tab.layout
+                                .nodes
+                                .values()
+                                .any(|n| n.label == name || n.path.leaf() == Some(&new_id))
+                        });
+                    if !visible_in_active {
+                        self.open_or_focus_root(&new_id, ViewKind::General);
+                    }
+                }
             }
             "part" => {
                 self.execute_command(SyssurCommand::CreatePartUsage {
@@ -1085,9 +1162,41 @@ impl SyssurApp {
                 item,
                 container,
                 file,
+                world_pos,
             } => {
+                let before_keys: BTreeSet<String> = self
+                    .view_tabs
+                    .get(&tab_id)
+                    .map(|t| t.layout.nodes.keys().cloned().collect())
+                    .unwrap_or_default();
                 let cname = container.and_then(|p| p.leaf().map(|l| l.short_name().to_string()));
                 self.place_catalog_item(item, cname, file);
+                if let Some(drop_world) = world_pos {
+                    if let Some(tab) = self.view_tabs.get_mut(&tab_id) {
+                        let new_nodes: Vec<(String, InstancePath, syssur_layout::Rect2)> = tab
+                            .layout
+                            .nodes
+                            .iter()
+                            .filter(|(k, _)| !before_keys.contains(*k))
+                            .map(|(k, n)| (k.clone(), n.path.clone(), n.rect))
+                            .collect();
+                        if let Some((_, first_path, _)) = new_nodes.first().cloned() {
+                            for (key, _, rect) in new_nodes {
+                                let dx = drop_world.x - (rect.x + rect.w * 0.5);
+                                let dy = drop_world.y - (rect.y + rect.h * 0.5);
+                                let entry = tab
+                                    .node_offsets
+                                    .entry(key)
+                                    .or_insert(Point2 { x: 0.0, y: 0.0 });
+                                entry.x += dx;
+                                entry.y += dy;
+                            }
+                            tab.canvas.selected = Some(first_path);
+                            tab.startup_autolayout_pending = false;
+                            tab.recompute_layout_only();
+                        }
+                    }
+                }
             }
             CanvasAction::MoveNodes { deltas } => {
                 if let Some(tab) = self.view_tabs.get_mut(&tab_id) {
@@ -1099,6 +1208,7 @@ impl SyssurApp {
                         entry.x += dx;
                         entry.y += dy;
                     }
+                    tab.startup_autolayout_pending = false;
                     tab.recompute_layout_only();
                 }
             }
@@ -1108,11 +1218,57 @@ impl SyssurApp {
                 placement,
             } => {
                 if let Some(tab) = self.view_tabs.get_mut(&tab_id) {
+                    tab.startup_autolayout_pending = false;
                     if let Some(pos) = placement {
                         tab.port_overrides.insert((node_key, port_name), pos);
                     } else {
                         tab.port_overrides.remove(&(node_key, port_name));
                     }
+                    tab.recompute_layout_only();
+                }
+            }
+            CanvasAction::ResizeNode {
+                node_key,
+                width,
+                height,
+                anchor_x,
+                anchor_y,
+                anchor_right,
+                anchor_bottom,
+            } => {
+                if let Some(tab) = self.view_tabs.get_mut(&tab_id) {
+                    tab.startup_autolayout_pending = false;
+                    tab.node_size_overrides
+                        .insert(node_key.clone(), (width, height));
+                    tab.recompute_layout_only();
+                    if let Some(new_rect) = tab.layout.nodes.get(&node_key).map(|n| n.rect) {
+                        let cur_ax = if anchor_right {
+                            new_rect.x + new_rect.w
+                        } else {
+                            new_rect.x
+                        };
+                        let cur_ay = if anchor_bottom {
+                            new_rect.y + new_rect.h
+                        } else {
+                            new_rect.y
+                        };
+                        let adj_x = anchor_x - cur_ax;
+                        let adj_y = anchor_y - cur_ay;
+                        if adj_x.abs() > 0.05 || adj_y.abs() > 0.05 {
+                            let entry = tab
+                                .node_offsets
+                                .entry(node_key)
+                                .or_insert(Point2 { x: 0.0, y: 0.0 });
+                            entry.x += adj_x;
+                            entry.y += adj_y;
+                            tab.recompute_layout_only();
+                        }
+                    }
+                }
+            }
+            CanvasAction::ResetNodeSize { node_key } => {
+                if let Some(tab) = self.view_tabs.get_mut(&tab_id) {
+                    tab.node_size_overrides.remove(&node_key);
                     tab.recompute_layout_only();
                 }
             }
@@ -1144,16 +1300,94 @@ impl SyssurApp {
             }
             CanvasAction::SelectNode { path } => {
                 if let Some(leaf) = path.leaf().cloned() {
+                    self.inspector_tab = InspectorTab::Details;
                     self.selected_target = SelectedTarget::Node {
                         path,
                         element_id: leaf,
                     };
                 }
             }
+            CanvasAction::SelectPort {
+                node_path,
+                node_label,
+                port_name,
+            } => {
+                self.inspector_tab = InspectorTab::Details;
+                let node_key = node_path.canonical_key();
+                let (port_type, direction, is_conjugated, side, file) = self
+                    .view_tabs
+                    .get(&tab_id)
+                    .map(|tab| {
+                        let p = tab
+                            .layout
+                            .nodes
+                            .get(&node_key)
+                            .and_then(|n| n.ports.iter().find(|p| p.name == port_name));
+                        let f = tab
+                            .node_meta
+                            .get(&node_key)
+                            .map(|m| m.source_file.clone())
+                            .unwrap_or_else(|| self.active_file.clone());
+                        (
+                            p.and_then(|p| p.type_label.clone()),
+                            p.map_or(syssur_model::PortDirection::InOut, |p| p.direction),
+                            p.is_some_and(|p| p.is_conjugated),
+                            p.map(|p| p.side),
+                            f,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        (
+                            None,
+                            syssur_model::PortDirection::InOut,
+                            false,
+                            None,
+                            self.active_file.clone(),
+                        )
+                    });
+                self.selected_target = SelectedTarget::Port {
+                    node_key,
+                    owner_label: node_label,
+                    port_name,
+                    port_type,
+                    direction,
+                    is_conjugated,
+                    side,
+                    file,
+                };
+            }
             CanvasAction::SelectEdge { index } => {
                 if let Some(tab) = self.view_tabs.get(&tab_id) {
                     if let Some(edge) = tab.layout.edges.get(index) {
-                        if let Some(succ) = self
+                        self.inspector_tab = InspectorTab::Details;
+                        if let Some(conn) = self
+                            .graph
+                            .connections
+                            .iter()
+                            .enumerate()
+                            .find(|(i, c)| format!("{}#{i}", c.id) == edge.id)
+                            .map(|(_, c)| c)
+                        {
+                            let (_, sp) = split_port_ref(&conn.source_path);
+                            let (_, tp) = split_port_ref(&conn.target_path);
+                            self.selected_target = SelectedTarget::Edge {
+                                name: conn.name.clone(),
+                                source: conn.source_path.clone(),
+                                target: conn.target_path.clone(),
+                                source_port: sp.map(str::to_string),
+                                target_port: tp.map(str::to_string),
+                                kind: conn.kind,
+                                type_name: conn
+                                    .interface_def
+                                    .as_ref()
+                                    .map(|d| d.short_name().to_string()),
+                                owner_scope: Some(conn.owner_scope.as_str().to_string()),
+                                trigger: None,
+                                guard: edge.guard.clone(),
+                                effect: None,
+                                file: conn.span.file.clone(),
+                            };
+                        } else if let Some(succ) = self
                             .graph
                             .successions
                             .iter()
@@ -1162,9 +1396,14 @@ impl SyssurApp {
                             .map(|(_, s)| s)
                         {
                             self.selected_target = SelectedTarget::Edge {
+                                name: None,
                                 source: succ.source.clone(),
                                 target: succ.target.clone(),
+                                source_port: None,
+                                target_port: None,
                                 kind: RelationshipKind::Succession,
+                                type_name: None,
+                                owner_scope: Some(succ.owner_scope.as_str().to_string()),
                                 trigger: None,
                                 guard: succ.guard.clone(),
                                 effect: None,
@@ -1179,19 +1418,68 @@ impl SyssurApp {
                             .map(|(_, t)| t)
                         {
                             self.selected_target = SelectedTarget::Edge {
+                                name: None,
                                 source: tr.source.clone(),
                                 target: tr.target.clone(),
+                                source_port: None,
+                                target_port: None,
                                 kind: RelationshipKind::Transition,
+                                type_name: None,
+                                owner_scope: Some(tr.owner_scope.as_str().to_string()),
                                 trigger: tr.trigger.clone(),
                                 guard: tr.guard.clone(),
                                 effect: tr.effect.clone(),
                                 file: tr.span.file.clone(),
                             };
+                        } else if let Some(link) = self
+                            .graph
+                            .trace_links
+                            .iter()
+                            .enumerate()
+                            .find(|(i, _)| format!("trace#{i}") == edge.id)
+                            .map(|(_, l)| l)
+                        {
+                            self.selected_target = SelectedTarget::Edge {
+                                name: None,
+                                source: link.target.clone(),
+                                target: link.requirement.as_str().to_string(),
+                                source_port: None,
+                                target_port: None,
+                                kind: link.kind,
+                                type_name: None,
+                                owner_scope: None,
+                                trigger: None,
+                                guard: None,
+                                effect: None,
+                                file: link.span.file.clone(),
+                            };
+                        } else if let Some(spec) =
+                            tab.base_input.edges.iter().find(|e| e.id == edge.id)
+                        {
+                            self.selected_target = SelectedTarget::Edge {
+                                name: spec.label.clone(),
+                                source: spec.source_node.to_string(),
+                                target: spec.target_node.to_string(),
+                                source_port: spec.source_port.clone(),
+                                target_port: spec.target_port.clone(),
+                                kind: spec.kind,
+                                type_name: None,
+                                owner_scope: None,
+                                trigger: None,
+                                guard: spec.guard.clone(),
+                                effect: None,
+                                file: spec.span.file.clone(),
+                            };
                         } else {
                             self.selected_target = SelectedTarget::Edge {
+                                name: edge.label.clone(),
                                 source: edge.id.clone(),
                                 target: edge.label.clone().unwrap_or_default(),
+                                source_port: None,
+                                target_port: None,
                                 kind: edge.kind,
+                                type_name: None,
+                                owner_scope: None,
                                 trigger: None,
                                 guard: edge.guard.clone(),
                                 effect: None,
@@ -1235,6 +1523,7 @@ impl SyssurApp {
             CanvasAction::AutoLayout => {
                 if let Some(tab) = self.view_tabs.get_mut(&tab_id) {
                     tab.node_offsets.clear();
+                    tab.node_size_overrides.clear();
                     tab.port_overrides.clear();
                     tab.recompute_layout_only();
                     tab.needs_fit = true;
@@ -1253,6 +1542,8 @@ impl SyssurApp {
         let native_ppp = ctx.native_pixels_per_point().unwrap_or(1.0);
         if !self.settings.initialized_dpi {
             self.settings.initialized_dpi = true;
+            #[cfg(not(target_arch = "wasm32"))]
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
             if self.settings.auto_hidpi && native_ppp >= 1.5 {
                 self.settings.ui_scale = 1.15;
                 self.settings.base_font_size = 15.0;
@@ -1344,6 +1635,17 @@ impl SyssurApp {
     }
 
     fn open_rename_for_selected(&mut self) {
+        if let SelectedTarget::Port {
+            port_name, file, ..
+        } = &self.selected_target
+        {
+            self.rename_dialog = Some(RenameDialog {
+                old_name: port_name.clone(),
+                new_name: port_name.clone(),
+                file: file.clone(),
+            });
+            return;
+        }
         let target_id = match &self.selected_target {
             SelectedTarget::Node { element_id, .. } | SelectedTarget::Element(element_id) => {
                 Some(element_id.clone())
@@ -1363,6 +1665,18 @@ impl SyssurApp {
     }
 
     fn delete_selected(&mut self) {
+        if let SelectedTarget::Port {
+            port_name, file, ..
+        } = &self.selected_target
+        {
+            self.execute_command(SyssurCommand::DeleteElement {
+                file: file.clone(),
+                kind_hint: Some("port".to_string()),
+                name: port_name.clone(),
+            });
+            self.selected_target = SelectedTarget::None;
+            return;
+        }
         let target_id = match &self.selected_target {
             SelectedTarget::Node { element_id, .. } | SelectedTarget::Element(element_id) => {
                 Some(element_id.clone())
@@ -1862,6 +2176,7 @@ impl SyssurApp {
 
                 if let Some(elem) = select_elem {
                     self.selected_target = SelectedTarget::Element(elem);
+                    self.inspector_tab = InspectorTab::Details;
                 }
                 if let Some(vid) = open_view_id {
                     self.open_or_focus_view(&vid);
@@ -1922,6 +2237,7 @@ impl SyssurApp {
                                 .active_view_tab
                                 .and_then(|tid| self.view_tabs.get_mut(&tid))
                             {
+                                tab.startup_autolayout_pending = false;
                                 if let Some(pos) = placement {
                                     tab.port_overrides.insert((node_key, port_name), pos);
                                 } else {
@@ -2113,6 +2429,7 @@ impl TabViewer for CenterTabViewer<'_> {
                 if auto_layout_clicked {
                     if let Some(vtab) = self.app.view_tabs.get_mut(&tab_id) {
                         vtab.node_offsets.clear();
+                        vtab.node_size_overrides.clear();
                         vtab.port_overrides.clear();
                         vtab.recompute_layout_only();
                         vtab.needs_fit = true;
@@ -2136,9 +2453,30 @@ impl TabViewer for CenterTabViewer<'_> {
                     .collect();
                 let ctx = ui.ctx().clone();
                 let maybe_action = if let Some(vtab) = self.app.view_tabs.get_mut(&tab_id) {
-                    if vtab.needs_fit {
-                        vtab.canvas.fit_to_bounds(&vtab.layout, ui.available_size());
-                        vtab.needs_fit = false;
+                    let avail = ui.available_size();
+                    if avail.x > 64.0 && avail.y > 64.0 {
+                        if vtab.startup_autolayout_pending {
+                            if (avail - vtab.last_fit_viewport).length() > 4.0 {
+                                vtab.node_offsets.clear();
+                                vtab.node_size_overrides.clear();
+                                vtab.port_overrides.clear();
+                                vtab.recompute_layout_only();
+                                vtab.canvas.fit_to_bounds(&vtab.layout, avail);
+                                vtab.last_fit_viewport = avail;
+                                vtab.needs_fit = false;
+                                vtab.startup_stable_frames = 0;
+                            } else {
+                                vtab.startup_stable_frames =
+                                    vtab.startup_stable_frames.saturating_add(1);
+                                if vtab.startup_stable_frames >= 3 {
+                                    vtab.startup_autolayout_pending = false;
+                                }
+                            }
+                        } else if vtab.needs_fit {
+                            vtab.canvas.fit_to_bounds(&vtab.layout, avail);
+                            vtab.last_fit_viewport = avail;
+                            vtab.needs_fit = false;
+                        }
                     }
                     vtab.canvas.show(
                         ui,
@@ -2303,7 +2641,17 @@ fn render_explorer_package(
     pending_cmd: &mut Option<SyssurCommand>,
     locale: Locale,
 ) {
-    let header_resp = ui.collapsing(format!("pkg {}", pkg.name), |ui| {
+    let pkg_selected = matches!(selected_target, SelectedTarget::Element(id) if id == &pkg.id);
+    let header_resp = explorer_collapsing_with_icon(
+        ui,
+        ("exp_pkg", pkg.id.as_str()),
+        true,
+        pkg_selected,
+        CatalogCategory::NamespacesAndAnnotations,
+        "package",
+        false,
+        format!("pkg {}", pkg.name),
+        |ui| {
         // Direct child sub-packages first
         let mut child_pkgs: Vec<_> = graph
             .packages
@@ -2335,7 +2683,16 @@ fn render_explorer_package(
             .values()
             .filter(|v| is_direct_pkg_child(&pkg.id, &v.id))
         {
-            let resp = ui.selectable_label(false, format!("view {}", v.name));
+            let selected = matches!(selected_target, SelectedTarget::Element(id) if id == &v.id);
+            let resp = explorer_icon_row(
+                ui,
+                selected,
+                CatalogCategory::ViewsAndMetadata,
+                "view",
+                !v.is_usage,
+                format!("view {}", v.name),
+                None,
+            );
             if resp.clicked() {
                 *open_view_id = Some(v.id.clone());
                 *select_elem = Some(v.id.clone());
@@ -2369,17 +2726,21 @@ fn render_explorer_package(
             .filter(|d| is_direct_pkg_child(&pkg.id, &d.id))
         {
             let selected = matches!(selected_target, SelectedTarget::Element(id) if id == &pd.id);
-            let resp = ui.dnd_drag_source(
-                Id::unique(("exp_pd", pd.id.as_str())),
-                pd.id.clone(),
-                |ui| ui.selectable_label(selected, format!("part def {}", pd.name)),
+            let resp = explorer_icon_row(
+                ui,
+                selected,
+                CatalogCategory::Structure,
+                "part",
+                true,
+                format!("part def {}", pd.name),
+                Some(pd.id.clone()),
             );
-            if resp.inner.clicked() {
+            if resp.clicked() {
                 *select_elem = Some(pd.id.clone());
                 *open_root_id = Some((pd.id.clone(), ViewKind::General));
             }
             explorer_element_context_menu(
-                &resp.inner,
+                &resp,
                 &pd.id,
                 &pd.name,
                 "part def",
@@ -2418,16 +2779,20 @@ fn render_explorer_package(
             .filter(|p| is_direct_pkg_child(&pkg.id, &p.id))
         {
             let selected = matches!(selected_target, SelectedTarget::Element(id) if id == &pdef.id);
-            let resp = ui.dnd_drag_source(
-                Id::unique(("exp_pdef", pdef.id.as_str())),
-                pdef.id.clone(),
-                |ui| ui.selectable_label(selected, format!("port def {}", pdef.name)),
+            let resp = explorer_icon_row(
+                ui,
+                selected,
+                CatalogCategory::PortsAndInterfaces,
+                "port",
+                true,
+                format!("port def {}", pdef.name),
+                Some(pdef.id.clone()),
             );
-            if resp.inner.clicked() {
+            if resp.clicked() {
                 *select_elem = Some(pdef.id.clone());
             }
             explorer_element_context_menu(
-                &resp.inner,
+                &resp,
                 &pdef.id,
                 &pdef.name,
                 "port def",
@@ -2488,16 +2853,20 @@ fn render_explorer_package(
                 .as_deref()
                 .map(|s| format!("[{s}] "))
                 .unwrap_or_default();
-            let resp = ui.dnd_drag_source(
-                Id::unique(("exp_req", req.id.as_str())),
-                req.id.clone(),
-                |ui| ui.selectable_label(selected, format!("req {badge}{}", req.name)),
+            let resp = explorer_icon_row(
+                ui,
+                selected,
+                CatalogCategory::CalcConstraintsRequirements,
+                "requirement",
+                !req.is_usage,
+                format!("req {badge}{}", req.name),
+                Some(req.id.clone()),
             );
-            if resp.inner.clicked() {
+            if resp.clicked() {
                 *select_elem = Some(req.id.clone());
             }
             explorer_element_context_menu(
-                &resp.inner,
+                &resp,
                 &req.id,
                 &req.name,
                 if req.is_usage {
@@ -2522,16 +2891,21 @@ fn render_explorer_package(
         {
             let selected = matches!(selected_target, SelectedTarget::Element(id) if id == &elem.id);
             let tag = short_kind_tag(elem.kind, elem.is_def);
-            let resp = ui.dnd_drag_source(
-                Id::unique(("exp_gen", elem.id.as_str())),
-                elem.id.clone(),
-                |ui| ui.selectable_label(selected, format!("{tag} {}", elem.name)),
+            let (cat, kw) = generic_element_icon_spec(elem.kind);
+            let resp = explorer_icon_row(
+                ui,
+                selected,
+                cat,
+                kw,
+                elem.is_def,
+                format!("{tag} {}", elem.name),
+                Some(elem.id.clone()),
             );
-            if resp.inner.clicked() {
+            if resp.clicked() {
                 *select_elem = Some(elem.id.clone());
             }
             explorer_element_context_menu(
-                &resp.inner,
+                &resp,
                 &elem.id,
                 &elem.name,
                 tag,
@@ -2545,10 +2919,12 @@ fn render_explorer_package(
         }
     });
 
-    if header_resp.header_response.clicked() {
+    if header_resp.clicked() {
         *select_elem = Some(pkg.id.clone());
     }
-    header_resp.header_response.context_menu(|ui| {
+    egui::Popup::context_menu(&header_resp)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
         ui.set_min_width(240.0);
         if ui.button("Open Package Diagram").clicked() {
             *open_root_id = Some((pkg.id.clone(), ViewKind::General));
@@ -2697,6 +3073,125 @@ fn short_kind_tag(kind: SysmlElementKind, is_def: bool) -> &'static str {
     }
 }
 
+fn generic_element_icon_spec(kind: SysmlElementKind) -> (CatalogCategory, &'static str) {
+    match kind {
+        SysmlElementKind::Attribute => (CatalogCategory::Structure, "attribute"),
+        SysmlElementKind::Enum => (CatalogCategory::Structure, "enum"),
+        SysmlElementKind::Item => (CatalogCategory::Structure, "item"),
+        SysmlElementKind::Occurrence
+        | SysmlElementKind::EventOccurrence
+        | SysmlElementKind::Timeslice
+        | SysmlElementKind::Snapshot
+        | SysmlElementKind::RefUsage => (CatalogCategory::Structure, "occurrence"),
+        SysmlElementKind::Interface
+        | SysmlElementKind::Connection
+        | SysmlElementKind::Allocation
+        | SysmlElementKind::Flow => (CatalogCategory::PortsAndInterfaces, "interface"),
+        SysmlElementKind::Constraint | SysmlElementKind::AssertConstraint => {
+            (CatalogCategory::CalcConstraintsRequirements, "constraint")
+        }
+        SysmlElementKind::Concern => (CatalogCategory::CalcConstraintsRequirements, "concern"),
+        SysmlElementKind::Calc => (CatalogCategory::CalcConstraintsRequirements, "calc"),
+        SysmlElementKind::UseCase | SysmlElementKind::IncludeUseCase => {
+            (CatalogCategory::CasesAndVerification, "use case")
+        }
+        SysmlElementKind::AnalysisCase => (CatalogCategory::CasesAndVerification, "analysis"),
+        SysmlElementKind::VerificationCase => {
+            (CatalogCategory::CasesAndVerification, "verification")
+        }
+        SysmlElementKind::Case
+        | SysmlElementKind::Subject
+        | SysmlElementKind::Actor
+        | SysmlElementKind::Stakeholder => (CatalogCategory::CasesAndVerification, "case"),
+        SysmlElementKind::TerminateAction => (CatalogCategory::ActionsAndControl, "terminate"),
+        SysmlElementKind::PerformAction
+        | SysmlElementKind::AcceptAction
+        | SysmlElementKind::SendAction
+        | SysmlElementKind::AssignAction
+        | SysmlElementKind::IfAction
+        | SysmlElementKind::LoopAction => (CatalogCategory::ActionsAndControl, "action"),
+        SysmlElementKind::ExhibitState => (CatalogCategory::StatesAndTransitions, "state"),
+        SysmlElementKind::Viewpoint => (CatalogCategory::ViewsAndMetadata, "viewpoint"),
+        SysmlElementKind::Rendering => (CatalogCategory::ViewsAndMetadata, "rendering"),
+        SysmlElementKind::Metadata | SysmlElementKind::TextualRep => {
+            (CatalogCategory::ViewsAndMetadata, "metadata")
+        }
+        SysmlElementKind::Comment => (CatalogCategory::NamespacesAndAnnotations, "comment"),
+        SysmlElementKind::Alias => (CatalogCategory::NamespacesAndAnnotations, "alias"),
+        SysmlElementKind::Filter => (CatalogCategory::NamespacesAndAnnotations, "filter"),
+    }
+}
+
+fn explorer_icon_row(
+    ui: &mut Ui,
+    selected: bool,
+    category: CatalogCategory,
+    keyword: &str,
+    is_def: bool,
+    label: impl Into<String>,
+    payload: Option<ElementId>,
+) -> egui::Response {
+    let label = label.into();
+    let sense = if payload.is_some() {
+        egui::Sense::click_and_drag()
+    } else {
+        egui::Sense::click()
+    };
+    let width = ui.available_width().max(120.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 19.0), sense);
+
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact_selectable(&resp, selected);
+        if selected || resp.hovered() || resp.is_pointer_button_down_on() {
+            ui.painter().rect_filled(rect, 3.0, visuals.bg_fill);
+        }
+        let icon_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + 3.0, rect.center().y - 6.5),
+            egui::vec2(13.0, 13.0),
+        );
+        paint_kind_icon(ui.painter(), icon_rect, category, keyword, is_def, false);
+        ui.painter().text(
+            egui::pos2(rect.left() + 20.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            FontId::proportional(12.5),
+            visuals.text_color(),
+        );
+    }
+
+    if let Some(p) = payload {
+        resp.dnd_set_drag_payload(p);
+    }
+    resp
+}
+
+#[allow(clippy::too_many_arguments)]
+fn explorer_collapsing_with_icon(
+    ui: &mut Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    default_open: bool,
+    selected: bool,
+    category: CatalogCategory,
+    keyword: &str,
+    is_def: bool,
+    label: impl Into<String>,
+    add_body: impl FnOnce(&mut Ui),
+) -> egui::Response {
+    let label = label.into();
+    let id = ui.make_persistent_id(id_salt);
+    let state = egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        id,
+        default_open,
+    );
+    let (_, header_inner, _) = state
+        .show_header(ui, |ui| {
+            explorer_icon_row(ui, selected, category, keyword, is_def, label, None)
+        })
+        .body(add_body);
+    header_inner.inner
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_explorer_part(
     ui: &mut Ui,
@@ -2716,18 +3211,23 @@ fn render_explorer_part(
     };
     let inspect_kind = is_top_level.then_some(ViewKind::General);
     if part.nested_parts.is_empty() {
-        let resp =
-            ui.dnd_drag_source(Id::unique(("exp_part", part.id.as_str())), part.id.clone(), |ui| {
-                ui.selectable_label(selected, label)
-            });
-        if resp.inner.clicked() {
+        let resp = explorer_icon_row(
+            ui,
+            selected,
+            CatalogCategory::Structure,
+            "part",
+            false,
+            label,
+            Some(part.id.clone()),
+        );
+        if resp.clicked() {
             *select_elem = Some(part.id.clone());
             if is_top_level {
                 *open_root_id = Some((part.id.clone(), ViewKind::General));
             }
         }
         explorer_element_context_menu(
-            &resp.inner,
+            &resp,
             &part.id,
             &part.name,
             "part",
@@ -2739,29 +3239,39 @@ fn render_explorer_part(
             locale,
         );
     } else {
-        let resp = ui.collapsing(label, |ui| {
-            for child in &part.nested_parts {
-                render_explorer_part(
-                    ui,
-                    child,
-                    false,
-                    selected_target,
-                    select_elem,
-                    rename_req,
-                    open_root_id,
-                    pending_cmd,
-                    locale,
-                );
-            }
-        });
-        if resp.header_response.clicked() {
+        let header_resp = explorer_collapsing_with_icon(
+            ui,
+            ("exp_part", part.id.as_str()),
+            false,
+            selected,
+            CatalogCategory::Structure,
+            "part",
+            false,
+            label,
+            |ui| {
+                for child in &part.nested_parts {
+                    render_explorer_part(
+                        ui,
+                        child,
+                        false,
+                        selected_target,
+                        select_elem,
+                        rename_req,
+                        open_root_id,
+                        pending_cmd,
+                        locale,
+                    );
+                }
+            },
+        );
+        if header_resp.clicked() {
             *select_elem = Some(part.id.clone());
             if is_top_level {
                 *open_root_id = Some((part.id.clone(), ViewKind::General));
             }
         }
         explorer_element_context_menu(
-            &resp.header_response,
+            &header_resp,
             &part.id,
             &part.name,
             "part",
@@ -2799,15 +3309,20 @@ fn render_explorer_action(
     let label = format!("{prefix} {}", act.name);
     let inspect_kind = (!act.children.is_empty()).then_some(ViewKind::ActionFlow);
     if act.children.is_empty() {
-        let resp =
-            ui.dnd_drag_source(Id::unique(("exp_act", act.id.as_str())), act.id.clone(), |ui| {
-                ui.selectable_label(selected, label)
-            });
-        if resp.inner.clicked() {
+        let resp = explorer_icon_row(
+            ui,
+            selected,
+            CatalogCategory::ActionsAndControl,
+            prefix,
+            false,
+            label,
+            Some(act.id.clone()),
+        );
+        if resp.clicked() {
             *select_elem = Some(act.id.clone());
         }
         explorer_element_context_menu(
-            &resp.inner,
+            &resp,
             &act.id,
             &act.name,
             prefix,
@@ -2819,26 +3334,36 @@ fn render_explorer_action(
             locale,
         );
     } else {
-        let resp = ui.collapsing(label, |ui| {
-            for child in &act.children {
-                render_explorer_action(
-                    ui,
-                    child,
-                    selected_target,
-                    select_elem,
-                    rename_req,
-                    open_root_id,
-                    pending_cmd,
-                    locale,
-                );
-            }
-        });
-        if resp.header_response.clicked() {
+        let header_resp = explorer_collapsing_with_icon(
+            ui,
+            ("exp_act", act.id.as_str()),
+            false,
+            selected,
+            CatalogCategory::ActionsAndControl,
+            prefix,
+            false,
+            label,
+            |ui| {
+                for child in &act.children {
+                    render_explorer_action(
+                        ui,
+                        child,
+                        selected_target,
+                        select_elem,
+                        rename_req,
+                        open_root_id,
+                        pending_cmd,
+                        locale,
+                    );
+                }
+            },
+        );
+        if header_resp.clicked() {
             *select_elem = Some(act.id.clone());
             *open_root_id = Some((act.id.clone(), ViewKind::ActionFlow));
         }
         explorer_element_context_menu(
-            &resp.header_response,
+            &header_resp,
             &act.id,
             &act.name,
             prefix,
@@ -2868,15 +3393,20 @@ fn render_explorer_state(
     let label = format!("{kw} {}", st.name);
     let inspect_kind = (!st.children.is_empty()).then_some(ViewKind::StateTransition);
     if st.children.is_empty() {
-        let resp =
-            ui.dnd_drag_source(Id::unique(("exp_st", st.id.as_str())), st.id.clone(), |ui| {
-                ui.selectable_label(selected, label)
-            });
-        if resp.inner.clicked() {
+        let resp = explorer_icon_row(
+            ui,
+            selected,
+            CatalogCategory::StatesAndTransitions,
+            "state",
+            st.is_def,
+            label,
+            Some(st.id.clone()),
+        );
+        if resp.clicked() {
             *select_elem = Some(st.id.clone());
         }
         explorer_element_context_menu(
-            &resp.inner,
+            &resp,
             &st.id,
             &st.name,
             kw,
@@ -2888,26 +3418,36 @@ fn render_explorer_state(
             locale,
         );
     } else {
-        let resp = ui.collapsing(label, |ui| {
-            for child in &st.children {
-                render_explorer_state(
-                    ui,
-                    child,
-                    selected_target,
-                    select_elem,
-                    rename_req,
-                    open_root_id,
-                    pending_cmd,
-                    locale,
-                );
-            }
-        });
-        if resp.header_response.clicked() {
+        let header_resp = explorer_collapsing_with_icon(
+            ui,
+            ("exp_st", st.id.as_str()),
+            false,
+            selected,
+            CatalogCategory::StatesAndTransitions,
+            "state",
+            st.is_def,
+            label,
+            |ui| {
+                for child in &st.children {
+                    render_explorer_state(
+                        ui,
+                        child,
+                        selected_target,
+                        select_elem,
+                        rename_req,
+                        open_root_id,
+                        pending_cmd,
+                        locale,
+                    );
+                }
+            },
+        );
+        if header_resp.clicked() {
             *select_elem = Some(st.id.clone());
             *open_root_id = Some((st.id.clone(), ViewKind::StateTransition));
         }
         explorer_element_context_menu(
-            &resp.header_response,
+            &header_resp,
             &st.id,
             &st.name,
             kw,
@@ -3055,8 +3595,7 @@ fn collect_action_nodes_recursive(
     };
     let (shape, width, height) = match node.kind {
         ActionNodeKind::Action => {
-            let w = (node.name.len() as f32 * 8.2 + 44.0).clamp(150.0, 260.0);
-            let h = if node.children.is_empty() { 48.0 } else { 90.0 };
+            let (w, h) = fit_labeled_box_size("«action» ", &node.name, !node.children.is_empty(), 130.0);
             (NodeShape::ActionBox, w, h)
         }
         ActionNodeKind::Start => (NodeShape::StartCircle, 26.0, 26.0),
@@ -3070,8 +3609,11 @@ fn collect_action_nodes_recursive(
     meta.insert(
         path.canonical_key(),
         NodeMeta {
+            is_def: false,
             type_name: None,
             type_def: Some(node.id.clone()),
+            specializes: None,
+            multiplicity: None,
             source_file: node.span.file.clone(),
             origin: FeatureOrigin::Owned,
             attributes: vec![],
@@ -3141,8 +3683,11 @@ fn build_state_transition_layout(
             meta.insert(
                 p.canonical_key(),
                 NodeMeta {
+                    is_def: false,
                     type_name: None,
                     type_def: None,
+                    specializes: None,
+                    multiplicity: None,
                     source_file: tr.span.file.clone(),
                     origin: FeatureOrigin::Owned,
                     attributes: vec![],
@@ -3194,20 +3739,26 @@ fn collect_state_nodes_recursive(
         Some(p) => p.push(node.id.clone()),
         None => InstancePath::root(node.id.clone()),
     };
-    let w = (node.name.len() as f32 * 8.2 + 44.0).clamp(140.0, 250.0);
-    let h = if node.children.is_empty() { 48.0 } else { 90.0 };
+    let (w, h) = fit_labeled_box_size("«state» ", &node.name, !node.children.is_empty(), 130.0);
     path_by_name.insert(node.name.clone(), path.clone());
     meta.insert(
         path.canonical_key(),
         NodeMeta {
+            is_def: node.is_def,
             type_name: None,
             type_def: Some(node.id.clone()),
+            specializes: None,
+            multiplicity: None,
             source_file: node.span.file.clone(),
             origin: FeatureOrigin::Owned,
             attributes: vec![],
             short_id: None,
             doc: node.doc.clone(),
-            stereotype: "«state»".to_string(),
+            stereotype: if node.is_def {
+                "«state def»".to_string()
+            } else {
+                "«state»".to_string()
+            },
         },
     );
     input.nodes.push(LayoutNodeSpec {
@@ -3223,6 +3774,35 @@ fn collect_state_nodes_recursive(
     for child in &node.children {
         collect_state_nodes_recursive(child, Some(&path), path_by_name, input, meta);
     }
+}
+
+fn collect_instantiated_part_defs(graph: &DefinitionGraph) -> BTreeSet<ElementId> {
+    fn visit_usage(
+        graph: &DefinitionGraph,
+        u: &syssur_model::PartUsage,
+        out: &mut BTreeSet<ElementId>,
+    ) {
+        if let Some(ref td) = u.type_def {
+            out.insert(td.clone());
+            if let Some(pd) = graph.resolve_part_def(td) {
+                out.insert(pd.id.clone());
+            }
+        }
+        for child in &u.nested_parts {
+            visit_usage(graph, child, out);
+        }
+    }
+
+    let mut out = BTreeSet::new();
+    for pd in graph.part_defs.values() {
+        for u in &pd.parts {
+            visit_usage(graph, u, &mut out);
+        }
+    }
+    for u in graph.top_level_parts.values() {
+        visit_usage(graph, u, &mut out);
+    }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3243,11 +3823,20 @@ fn populate_filtered_structural_nodes(
         .filter(|id| filter.matches_element(id))
         .cloned()
         .collect();
+    let instantiated_types = collect_instantiated_part_defs(graph);
 
     let before_count = input.nodes.len();
+    let mut shown_part_defs = 0usize;
     for root in &part_def_roots {
+        if shown_part_defs >= max_part_defs {
+            break;
+        }
         if let Some(tree) = InstanceNode::expand_from_graph(graph, root, 2) {
-            if !tree.children.is_empty() || graph.part_defs.len() <= 6 {
+            if !tree.children.is_empty()
+                || !instantiated_types.contains(root)
+                || graph.part_defs.len() <= 6
+            {
+                shown_part_defs += 1;
                 collect_layout_nodes_filtered(
                     graph,
                     &tree,
@@ -3307,27 +3896,40 @@ fn populate_filtered_structural_nodes(
             let path = InstancePath::root(req.id.clone());
             if expanded_keys.insert(path.canonical_key()) {
                 extra_count += 1;
+                let (width, height) = fit_requirement_card_size(
+                    "«requirement»",
+                    req.short_id.as_deref(),
+                    &req.name,
+                    req.doc.as_deref(),
+                );
                 input.nodes.push(LayoutNodeSpec {
                     path: path.clone(),
                     parent: None,
                     label: req.name.clone(),
                     shape: NodeShape::RequirementCard,
-                    width: 220.0,
-                    height: if req.doc.is_some() { 68.0 } else { 48.0 },
+                    width,
+                    height,
                     ports: vec![],
                     span: req.span.clone(),
                 });
                 meta.insert(
                     path.canonical_key(),
                     NodeMeta {
+                        is_def: !req.is_usage,
                         type_name: None,
                         type_def: Some(req.id.clone()),
+                        specializes: None,
+                        multiplicity: None,
                         source_file: req.span.file.clone(),
                         origin: FeatureOrigin::Owned,
                         attributes: vec![],
                         short_id: req.short_id.clone(),
                         doc: req.doc.clone(),
-                        stereotype: "«requirement»".to_string(),
+                        stereotype: if req.is_usage {
+                            "«requirement»".to_string()
+                        } else {
+                            "«requirement def»".to_string()
+                        },
                     },
                 );
             }
@@ -3342,27 +3944,36 @@ fn populate_filtered_structural_nodes(
             let path = InstancePath::root(st.id.clone());
             if expanded_keys.insert(path.canonical_key()) {
                 extra_count += 1;
+                let st_stereo = if st.is_def {
+                    "«state def»".to_string()
+                } else {
+                    "«state»".to_string()
+                };
+                let (width, height) = fit_labeled_box_size(&st_stereo, &st.name, false, 130.0);
                 input.nodes.push(LayoutNodeSpec {
                     path: path.clone(),
                     parent: None,
                     label: st.name.clone(),
                     shape: NodeShape::StateBox,
-                    width: 170.0,
-                    height: 50.0,
+                    width,
+                    height,
                     ports: vec![],
                     span: st.span.clone(),
                 });
                 meta.insert(
                     path.canonical_key(),
                     NodeMeta {
+                        is_def: st.is_def,
                         type_name: None,
                         type_def: Some(st.id.clone()),
+                        specializes: None,
+                        multiplicity: None,
                         source_file: st.span.file.clone(),
                         origin: FeatureOrigin::Owned,
                         attributes: vec![],
                         short_id: None,
                         doc: st.doc.clone(),
-                        stereotype: "«state»".to_string(),
+                        stereotype: st_stereo,
                     },
                 );
             }
@@ -3413,21 +4024,41 @@ fn populate_filtered_structural_nodes(
                 },
             ),
         };
+        let type_name = elem.type_ref.as_ref().map(|t| t.short_name().to_string());
+        let (width, height) = if shape == NodeShape::ConstraintCard {
+            fit_requirement_card_size(
+                stereo,
+                elem.short_id.as_deref(),
+                &elem.name,
+                elem.doc.as_deref(),
+            )
+        } else {
+            fit_generic_element_size(
+                stereo,
+                &elem.name,
+                type_name.as_deref(),
+                shape,
+                elem.doc.is_some(),
+            )
+        };
         input.nodes.push(LayoutNodeSpec {
             path: path.clone(),
             parent: None,
             label: elem.name.clone(),
             shape,
-            width: 185.0,
-            height: if elem.doc.is_some() { 64.0 } else { 48.0 },
+            width,
+            height,
             ports: vec![],
             span: elem.span.clone(),
         });
         meta.insert(
             path.canonical_key(),
             NodeMeta {
-                type_name: elem.type_ref.as_ref().map(|t| t.short_name().to_string()),
+                is_def: elem.is_def,
+                type_name,
                 type_def: Some(elem.id.clone()),
+                specializes: None,
+                multiplicity: None,
                 source_file: elem.span.file.clone(),
                 origin: FeatureOrigin::Owned,
                 attributes: vec![],
@@ -3524,13 +4155,18 @@ fn build_structural_layout(
                 target_node: dst_node.clone(),
                 target_port: dst_port.map(str::to_string),
                 kind: conn.kind,
-                label: conn.name.clone().or_else(|| match conn.kind {
-                    RelationshipKind::Flow => Some("«flow»".into()),
-                    RelationshipKind::Allocate => Some("«allocate»".into()),
-                    RelationshipKind::Dependency => Some("«dependency»".into()),
-                    RelationshipKind::Binding => Some("=".into()),
-                    _ => None,
-                }),
+                label: match (&conn.name, &conn.interface_def) {
+                    (Some(n), Some(idef)) => Some(format!("{n} : {}", idef.short_name())),
+                    (Some(n), None) => Some(n.clone()),
+                    (None, Some(idef)) => Some(format!(": {}", idef.short_name())),
+                    (None, None) => match conn.kind {
+                        RelationshipKind::Flow => Some("«flow»".into()),
+                        RelationshipKind::Allocate => Some("«allocate»".into()),
+                        RelationshipKind::Dependency => Some("«dependency»".into()),
+                        RelationshipKind::Binding => Some("=".into()),
+                        _ => None,
+                    },
+                },
                 guard: None,
                 span: conn.span.clone(),
             });
@@ -3590,6 +4226,153 @@ fn build_structural_layout(
 }
 
 #[allow(clippy::too_many_arguments)]
+const MAX_VISIBLE_BLOCK_ATTRS: usize = 8;
+
+fn find_part_multiplicity(graph: &DefinitionGraph, id: &ElementId) -> Option<u32> {
+    let base = id.as_str().split('#').next().unwrap_or(id.as_str());
+    let base_id = ElementId::new(base);
+    fn search(u: &syssur_model::PartUsage, id: &ElementId) -> Option<u32> {
+        if &u.id == id {
+            return u.multiplicity;
+        }
+        u.nested_parts.iter().find_map(|c| search(c, id))
+    }
+    graph
+        .top_level_parts
+        .values()
+        .find_map(|u| search(u, &base_id))
+        .or_else(|| {
+            graph
+                .part_defs
+                .values()
+                .flat_map(|pd| pd.parts.iter())
+                .find_map(|u| search(u, &base_id))
+        })
+}
+
+fn format_part_stereotype(
+    is_def: bool,
+    mods: Option<&syssur_model::ElementModifiers>,
+) -> String {
+    let mut words = Vec::new();
+    if let Some(m) = mods {
+        if m.is_variation {
+            words.push("variation");
+        } else if m.is_variant {
+            words.push("variant");
+        }
+        if m.is_abstract {
+            words.push("abstract");
+        }
+        if m.is_individual {
+            words.push("individual");
+        }
+        if m.is_ref {
+            words.push("ref");
+        }
+    }
+    words.push(if is_def { "part def" } else { "part" });
+    format!("«{}»", words.join(" "))
+}
+
+fn fit_part_block_size(
+    stereotype: &str,
+    label: &str,
+    type_name: Option<&str>,
+    specializes: Option<&str>,
+    multiplicity: Option<u32>,
+    origin: &FeatureOrigin,
+    attributes: &[String],
+    port_count: usize,
+) -> (f32, f32) {
+    let stereo_w = stereotype.chars().count() as f32 * 6.8 + 26.0;
+    let inh_len = usize::from(matches!(origin, FeatureOrigin::Inherited(_)));
+    let suffix_len = specializes
+        .map_or_else(
+            || type_name.map_or(0, |tn| 3 + tn.chars().count()),
+            |sp| 4 + sp.chars().count(),
+        )
+        + multiplicity.map_or(0, |m| 3 + m.to_string().len());
+    let title_w = (inh_len + label.chars().count() + suffix_len) as f32 * 8.2 + 28.0;
+    let origin_sub_len = match origin {
+        FeatureOrigin::Subsetted(t) => 8 + t.short_name().chars().count(),
+        FeatureOrigin::Redefined(t) => 10 + t.short_name().chars().count(),
+        _ => 0,
+    };
+    let origin_w = if origin_sub_len > 0 {
+        origin_sub_len as f32 * 6.8 + 26.0
+    } else {
+        0.0
+    };
+    let attr_w = attributes
+        .iter()
+        .take(MAX_VISIBLE_BLOCK_ATTRS)
+        .map(|a| a.chars().count() as f32 * 7.4 + 26.0)
+        .fold(0.0_f32, f32::max);
+    let port_w = 120.0 + (port_count.saturating_sub(2) as f32) * 24.0;
+    let width = stereo_w
+        .max(title_w)
+        .max(origin_w)
+        .max(attr_w)
+        .max(port_w)
+        .clamp(124.0, 480.0);
+
+    let name_comp_h = if origin_sub_len > 0 { 52.0 } else { 38.0 };
+    let shown_attrs = attributes.len().min(MAX_VISIBLE_BLOCK_ATTRS);
+    let attrs_comp_h = if shown_attrs > 0 {
+        20.0 + shown_attrs as f32 * 15.0 + 8.0
+    } else {
+        4.0
+    };
+    let port_pad = (port_count.saturating_sub(2) as f32) * 8.0;
+    let height = (name_comp_h + attrs_comp_h + port_pad).max(46.0);
+    (width, height)
+}
+
+fn fit_requirement_card_size(
+    stereo: &str,
+    short_id: Option<&str>,
+    label: &str,
+    doc: Option<&str>,
+) -> (f32, f32) {
+    let stereo_w = stereo.chars().count() as f32 * 7.0 + 20.0;
+    let title_len = short_id.map_or(0, |s| s.chars().count() + 3) + label.chars().count();
+    let title_w = title_len as f32 * 8.2 + 22.0;
+    let doc_w = doc.map_or(0.0, |d| {
+        let len = d.chars().count();
+        (len.min(46) + usize::from(len > 46) * 3) as f32 * 6.5 + 22.0
+    });
+    let width = stereo_w.max(title_w).max(doc_w).clamp(150.0, 440.0);
+    let height = if doc.is_some() { 64.0 } else { 44.0 };
+    (width, height)
+}
+
+fn fit_labeled_box_size(prefix: &str, label: &str, has_children: bool, min_w: f32) -> (f32, f32) {
+    let text_len = prefix.chars().count() + label.chars().count();
+    let width = (text_len as f32 * 8.0 + 28.0).clamp(min_w, 420.0);
+    let height = if has_children { 86.0 } else { 44.0 };
+    (width, height)
+}
+
+fn fit_generic_element_size(
+    stereo: &str,
+    label: &str,
+    type_name: Option<&str>,
+    shape: NodeShape,
+    has_doc: bool,
+) -> (f32, f32) {
+    let stereo_w = stereo.chars().count() as f32 * 7.0 + 22.0;
+    let title_len = label.chars().count() + type_name.map_or(0, |t| t.chars().count() + 3);
+    let pad = if shape == NodeShape::CaseOval {
+        36.0
+    } else {
+        22.0
+    };
+    let width = stereo_w.max(title_len as f32 * 8.0 + pad).clamp(130.0, 420.0);
+    let height = if has_doc { 62.0 } else { 46.0 };
+    (width, height)
+}
+
 fn collect_layout_nodes_filtered(
     graph: &DefinitionGraph,
     node: &InstanceNode,
@@ -3613,7 +4396,13 @@ fn collect_layout_nodes_filtered(
             let attributes: Vec<String> = node
                 .attributes
                 .iter()
-                .map(|a| a.display_label())
+                .map(|a| {
+                    if matches!(a.origin, FeatureOrigin::Inherited(_)) {
+                        format!("^{}", a.display_label())
+                    } else {
+                        a.display_label()
+                    }
+                })
                 .collect();
 
             let ports: Vec<LayoutPortSpec> = node
@@ -3628,8 +4417,46 @@ fn collect_layout_nodes_filtered(
                 })
                 .collect();
 
-            let height =
-                64.0 + (attributes.len().min(3) as f32) * 16.0 + (ports.len() as f32) * 8.0;
+            let leaf_id = node.path.leaf();
+            let base_leaf = leaf_id.map(|leaf| {
+                ElementId::new(leaf.as_str().split('#').next().unwrap_or(leaf.as_str()))
+            });
+            let is_def = node.path.0.len() == 1
+                && leaf_id.is_some_and(|leaf| graph.part_defs.contains_key(leaf));
+            let mods = base_leaf
+                .as_ref()
+                .and_then(|id| graph.element_modifiers.get(id));
+            let stereotype = format_part_stereotype(is_def, mods);
+            let specializes = if is_def {
+                leaf_id
+                    .and_then(|leaf| graph.part_defs.get(leaf))
+                    .filter(|pd| !pd.specializes.is_empty())
+                    .map(|pd| {
+                        pd.specializes
+                            .iter()
+                            .map(|s| s.short_name())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+            } else {
+                None
+            };
+            let multiplicity = if is_def {
+                None
+            } else {
+                leaf_id.and_then(|leaf| find_part_multiplicity(graph, leaf))
+            };
+            let type_name = node.type_def.as_ref().map(|d| d.short_name().to_string());
+            let (width, height) = fit_part_block_size(
+                &stereotype,
+                &node.label,
+                type_name.as_deref(),
+                specializes.as_deref(),
+                multiplicity,
+                &node.origin,
+                &attributes,
+                ports.len(),
+            );
             input.nodes.push(LayoutNodeSpec {
                 path: node.path.clone(),
                 parent: if is_compound_root {
@@ -3639,7 +4466,7 @@ fn collect_layout_nodes_filtered(
                 },
                 label: node.label.clone(),
                 shape: NodeShape::PartBlock,
-                width: 190.0,
+                width,
                 height,
                 ports,
                 span: node.span.clone(),
@@ -3655,14 +4482,17 @@ fn collect_layout_nodes_filtered(
             meta.insert(
                 key,
                 NodeMeta {
-                    type_name: node.type_def.as_ref().map(|d| d.short_name().to_string()),
+                    is_def,
+                    type_name,
                     type_def: node.type_def.clone(),
+                    specializes,
+                    multiplicity,
                     source_file,
                     origin: node.origin.clone(),
                     attributes,
                     short_id: None,
                     doc: None,
-                    stereotype: "«part»".to_string(),
+                    stereotype,
                 },
             );
         }
@@ -3701,7 +4531,10 @@ fn split_port_ref(path: &str) -> (&str, Option<&str>) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_maximized(true),
+        ..Default::default()
+    };
     eframe::run_native(
         "Syssur — SysML v2 Systems Modeling",
         options,
@@ -3796,5 +4629,250 @@ mod tests {
             !safety_tab.layout.nodes.is_empty(),
             "expected vehiclePartsTree_Safety view to display non-empty diagram nodes"
         );
+    }
+
+    #[test]
+    fn creating_part_def_displays_new_block_in_rover_diagram() {
+        let mut app = SyssurApp::default();
+        let part_def_item = crate::catalog::SYSML_V2_CATALOG
+            .iter()
+            .find(|item| item.id == "part_def")
+            .expect("part_def catalog item");
+        app.place_catalog_item(part_def_item, None, app.active_file.clone());
+
+        let active_tid = app.active_view_tab.expect("active view tab");
+        let active_tab = app.view_tabs.get(&active_tid).expect("active tab state");
+        assert!(
+            active_tab
+                .layout
+                .nodes
+                .values()
+                .any(|n| n.label.starts_with("NewPartDef")),
+            "expected newly created part def block to appear in active diagram"
+        );
+    }
+
+    #[test]
+    fn creating_part_def_at_world_pos_places_block_at_drop_point() {
+        let mut app = SyssurApp::default();
+        let tab_id = app.active_view_tab.expect("active view tab");
+        let part_def_item = crate::catalog::SYSML_V2_CATALOG
+            .iter()
+            .find(|item| item.id == "part_def")
+            .expect("part_def catalog item");
+        let drop_world = Point2 { x: 650.0, y: 420.0 };
+        let ctx = egui::Context::default();
+        app.handle_canvas_action(
+            tab_id,
+            CanvasAction::PlaceCatalogItem {
+                item: part_def_item,
+                container: None,
+                file: app.active_file.clone(),
+                world_pos: Some(drop_world),
+            },
+            &ctx,
+        );
+
+        let active_tab = app.view_tabs.get(&tab_id).expect("active tab state");
+        let new_node = active_tab
+            .layout
+            .nodes
+            .values()
+            .find(|n| n.label.starts_with("NewPartDef"))
+            .expect("newly placed part def node");
+        let cx = new_node.rect.x + new_node.rect.w * 0.5;
+        let cy = new_node.rect.y + new_node.rect.h * 0.5;
+        assert!(
+            (cx - drop_world.x).abs() < 1.0 && (cy - drop_world.y).abs() < 1.0,
+            "expected node centered at ({}, {}), got ({cx}, {cy})",
+            drop_world.x,
+            drop_world.y
+        );
+    }
+
+    #[test]
+    fn block_auto_size_fit_grows_with_title_and_attributes() {
+        let (w_short, h_short) = fit_part_block_size(
+            "«part def»",
+            "Wheel",
+            None,
+            None,
+            None,
+            &FeatureOrigin::Owned,
+            &[],
+            0,
+        );
+        let (w_long, _) = fit_part_block_size(
+            "«part»",
+            "powerSubsystemController",
+            Some("RedundantPowerController"),
+            None,
+            Some(2),
+            &FeatureOrigin::Owned,
+            &[],
+            0,
+        );
+        let attrs = vec![
+            "mass : Real = 12.5".to_string(),
+            "voltage : Real = 24.0".to_string(),
+            "temperatureLimitCelsius : Real = 85.0".to_string(),
+            "efficiency : Real = 0.94".to_string(),
+        ];
+        let (w_attrs, h_attrs) = fit_part_block_size(
+            "«part def»",
+            "Motor",
+            None,
+            None,
+            None,
+            &FeatureOrigin::Owned,
+            &attrs,
+            0,
+        );
+
+        assert!(w_short < 160.0 && h_short < 60.0, "compact block: ({w_short}, {h_short})");
+        assert!(
+            w_long > w_short + 150.0,
+            "long title must expand width: short={w_short}, long={w_long}"
+        );
+        assert!(
+            w_attrs > 280.0 && h_attrs > h_short + 40.0,
+            "attributes must grow width and height: short=({w_short}, {h_short}), attrs=({w_attrs}, {h_attrs})"
+        );
+    }
+
+    #[test]
+    fn part_def_vs_usage_meta_matches_sysml_v2_notation() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "notation.sysml".to_string(),
+            r#"package P {
+    abstract part def VehicleBase;
+    part def Rover :> VehicleBase {
+        part wheel : Wheel[4];
+        attribute mass : Real;
+    }
+    part def Wheel;
+    view V : GeneralView {
+        expose P::**;
+    }
+}
+"#
+            .to_string(),
+        );
+        let parsed = SysmlEngine::parse_workspace(&files).graph;
+        let view_id = ElementId::new("P::V");
+        let (_, meta) = build_layout_input_for_view(
+            &parsed,
+            &ViewScope::SysmlView(view_id),
+            ViewKind::General,
+            LayoutDirection::TopToBottom,
+        );
+
+        let rover_meta = meta.get("P::Rover").expect("Rover definition NodeMeta");
+        assert!(rover_meta.is_def);
+        assert_eq!(rover_meta.stereotype, "«part def»");
+        assert_eq!(rover_meta.specializes.as_deref(), Some("VehicleBase"));
+
+        let base_meta = meta
+            .get("P::VehicleBase")
+            .expect("VehicleBase abstract definition NodeMeta");
+        assert!(base_meta.is_def);
+        assert_eq!(base_meta.stereotype, "«abstract part def»");
+
+        let (_, wheel_meta) = meta
+            .iter()
+            .find(|(k, _)| k.contains("wheel"))
+            .expect("wheel usage NodeMeta");
+        assert!(!wheel_meta.is_def);
+        assert_eq!(wheel_meta.stereotype, "«part»");
+        assert_eq!(wheel_meta.multiplicity, Some(4));
+    }
+
+    #[test]
+    fn selecting_connection_edge_populates_relationship_type_and_endpoints() {
+        let mut app = SyssurApp::default();
+        let (tab_id, edge_idx) = app
+            .view_tabs
+            .iter()
+            .find_map(|(&tid, tab)| {
+                tab.layout
+                    .edges
+                    .iter()
+                    .enumerate()
+                    .find(|(_, e)| !e.id.starts_with("spec#"))
+                    .map(|(i, _)| (tid, i))
+            })
+            .expect("RoverSystem view with a routed relationship edge");
+
+        let ctx = egui::Context::default();
+        app.handle_canvas_action(tab_id, CanvasAction::SelectEdge { index: edge_idx }, &ctx);
+
+        match &app.selected_target {
+            SelectedTarget::Edge {
+                source,
+                target,
+                kind,
+                owner_scope,
+                file,
+                ..
+            } => {
+                assert!(!source.is_empty(), "expected non-empty source");
+                assert!(!target.is_empty(), "expected non-empty target");
+                assert!(!source.contains('#'), "source should be endpoint path, got {source}");
+                assert!(owner_scope.is_some(), "expected owner scope on connection edge");
+                assert!(!file.is_empty(), "expected source file");
+                let (disp, kw, _) = crate::inspector::relationship_kind_info(*kind);
+                assert!(!disp.is_empty() && !kw.is_empty());
+            }
+            other => panic!("expected SelectedTarget::Edge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resizing_block_updates_dimensions_and_pins_anchor_corner() {
+        let mut app = SyssurApp::default();
+        let tab_id = app.active_view_tab.expect("active view tab");
+        let (node_key, orig_rect) = {
+            let tab = app.view_tabs.get(&tab_id).expect("active tab");
+            let (k, n) = tab.layout.nodes.iter().next().expect("at least one node");
+            (k.clone(), n.rect)
+        };
+        let target_w = orig_rect.w + 90.0;
+        let target_h = orig_rect.h + 55.0;
+        let anchor_x = orig_rect.x + orig_rect.w;
+        let anchor_y = orig_rect.y + orig_rect.h;
+        let ctx = egui::Context::default();
+
+        app.handle_canvas_action(
+            tab_id,
+            CanvasAction::ResizeNode {
+                node_key: node_key.clone(),
+                width: target_w,
+                height: target_h,
+                anchor_x,
+                anchor_y,
+                anchor_right: true,
+                anchor_bottom: true,
+            },
+            &ctx,
+        );
+
+        let resized_rect = app.view_tabs[&tab_id].layout.nodes[&node_key].rect;
+        assert!(
+            (resized_rect.w - target_w).abs() < 1.0 && (resized_rect.h - target_h).abs() < 1.0,
+            "expected resized ({target_w}, {target_h}), got ({}, {})",
+            resized_rect.w,
+            resized_rect.h
+        );
+        assert!(
+            ((resized_rect.x + resized_rect.w) - anchor_x).abs() < 1.0
+                && ((resized_rect.y + resized_rect.h) - anchor_y).abs() < 1.0,
+            "expected bottom-right anchor ({anchor_x}, {anchor_y}) pinned, got ({}, {})",
+            resized_rect.x + resized_rect.w,
+            resized_rect.y + resized_rect.h
+        );
+
+        app.handle_canvas_action(tab_id, CanvasAction::AutoLayout, &ctx);
+        assert!(app.view_tabs[&tab_id].node_size_overrides.is_empty());
     }
 }

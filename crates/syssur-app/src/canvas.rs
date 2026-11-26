@@ -4,7 +4,10 @@
 //! 4-way selection handles, searchable Clause 7 right-click context menu,
 //! optional toggleable palette, and Explorer drag-to-expose support.
 
-use crate::catalog::{catalog_relationships, show_create_submenus, show_optional_palette, SysmlCatalogItem};
+use crate::catalog::{
+    catalog_item_row, catalog_relationships, show_create_submenus, show_optional_palette,
+    SysmlCatalogItem,
+};
 use crate::i18n::{tr, Locale, TextKey};
 use egui::{
     Align2, Color32, CornerRadius, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui,
@@ -24,8 +27,11 @@ use syssur_model::{
 
 #[derive(Clone, Debug)]
 pub struct NodeMeta {
+    pub is_def: bool,
     pub type_name: Option<String>,
     pub type_def: Option<ElementId>,
+    pub specializes: Option<String>,
+    pub multiplicity: Option<u32>,
     pub source_file: String,
     pub origin: FeatureOrigin,
     pub attributes: Vec<String>,
@@ -66,7 +72,9 @@ pub struct NodeHandleDrag {
 pub struct NodeDragState {
     pub primary_key: String,
     pub dragged_keys: Vec<String>,
+    pub press_screen: Pos2,
     pub last_world: Pos2,
+    pub activated: bool,
     pub alignment_x: Option<f32>,
     pub alignment_y: Option<f32>,
 }
@@ -76,6 +84,23 @@ pub struct PortDragState {
     pub node_key: String,
     pub port_name: String,
     pub node_rect: Rect2,
+    pub press_screen: Pos2,
+    pub activated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResizeCorner {
+    TopLeft,
+    TopRight,
+    BottomRight,
+    BottomLeft,
+}
+
+#[derive(Clone, Debug)]
+pub struct NodeResizeState {
+    pub node_key: String,
+    pub corner: ResizeCorner,
+    pub orig_rect: Rect2,
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +146,7 @@ pub enum CanvasAction {
         item: &'static SysmlCatalogItem,
         container: Option<InstancePath>,
         file: String,
+        world_pos: Option<syssur_layout::Point2>,
     },
     MoveNodes {
         deltas: Vec<(String, f32, f32)>,
@@ -130,12 +156,29 @@ pub enum CanvasAction {
         port_name: String,
         placement: Option<PortPlacement>,
     },
+    ResizeNode {
+        node_key: String,
+        width: f32,
+        height: f32,
+        anchor_x: f32,
+        anchor_y: f32,
+        anchor_right: bool,
+        anchor_bottom: bool,
+    },
+    ResetNodeSize {
+        node_key: String,
+    },
     ApplyCommand(SyssurCommand),
     ExposeElement {
         target: ElementId,
     },
     SelectNode {
         path: InstancePath,
+    },
+    SelectPort {
+        node_path: InstancePath,
+        node_label: String,
+        port_name: String,
     },
     SelectEdge {
         index: usize,
@@ -210,15 +253,18 @@ pub struct DiagramCanvas {
     pub pan: Vec2,
     pub zoom: f32,
     pub selected: Option<InstancePath>,
+    pub selected_port: Option<(String, String)>,
     pub selected_edge: Option<usize>,
     context_node: Option<InstancePath>,
     context_port: Option<(String, String, String)>,
+    context_world_pos: Option<Pos2>,
     wire_armed_port: Option<PortEndpoint>,
     context_search: String,
     wire_draft: Option<WireDraft>,
     handle_drag: Option<NodeHandleDrag>,
     node_drag: Option<NodeDragState>,
     port_drag: Option<PortDragState>,
+    node_resize: Option<NodeResizeState>,
     pending_choice: Option<PendingConnectChoice>,
     rel_pick: Option<RelationshipPickState>,
     node_tree: RTree<IndexedNode>,
@@ -233,15 +279,18 @@ impl Default for DiagramCanvas {
             pan: Vec2::new(60.0, 60.0),
             zoom: 1.0,
             selected: None,
+            selected_port: None,
             selected_edge: None,
             context_node: None,
             context_port: None,
+            context_world_pos: None,
             wire_armed_port: None,
             context_search: String::new(),
             wire_draft: None,
             handle_drag: None,
             node_drag: None,
             port_drag: None,
+            node_resize: None,
             pending_choice: None,
             rel_pick: None,
             node_tree: RTree::new(),
@@ -258,6 +307,7 @@ impl DiagramCanvas {
         self.handle_drag = None;
         self.node_drag = None;
         self.port_drag = None;
+        self.node_resize = None;
         self.wire_armed_port = None;
         self.pending_choice = None;
         self.rel_pick = None;
@@ -374,7 +424,9 @@ impl DiagramCanvas {
 
         if let Some(mut choice) = self.pending_choice.take() {
             let mut keep = true;
-            egui::Area::new(egui::Id::unique("connector_disambiguation_popup"))
+            let area_resp = egui::Area::new(egui::Id::unique("connector_disambiguation_popup"))
+                .order(egui::Order::Foreground)
+                .constrain(true)
                 .fixed_pos(choice.screen_pos)
                 .show(ui.ctx(), |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
@@ -431,6 +483,11 @@ impl DiagramCanvas {
                         }
                     });
                 });
+            if ui.input(|i| i.key_pressed(egui::Key::Escape))
+                || area_resp.response.clicked_elsewhere()
+            {
+                keep = false;
+            }
             if keep {
                 self.pending_choice = Some(choice);
             }
@@ -512,6 +569,10 @@ impl DiagramCanvas {
                         *active_tool = Some(item);
                     } else {
                         let drop_pos = ui.input(|i| i.pointer.interact_pos());
+                        let world_pos = drop_pos.map(|p| {
+                            let w = self.screen_to_world(p, origin);
+                            syssur_layout::Point2 { x: w.x, y: w.y }
+                        });
                         let hit_container = drop_pos.and_then(|p| {
                             Self::hit_test_node_static(
                                 self.pan,
@@ -531,87 +592,101 @@ impl DiagramCanvas {
                             item,
                             container: hit_container,
                             file,
+                            world_pos,
                         });
                     }
                 }
             }
         }
 
-        // Drag start priority: 1) Port (plain drag -> Reposition on border; Shift+Drag -> Wire) -> 2) 4-way handle -> 3) Free Node Move -> 4) Background pan
-        let middle_down = ui.input(|i| i.pointer.middle_down());
+        // Drag start priority: 0) Corner Resize -> 1) Port (plain drag -> Reposition on border; Shift+Drag -> Wire) -> 2) 4-way handle -> 3) Free Node Move -> 4) Background pan
         let shift_held = ui.input(|i| i.modifiers.shift);
-        if self.wire_draft.is_none()
+        if self.node_resize.is_none()
+            && self.wire_draft.is_none()
             && self.handle_drag.is_none()
             && self.node_drag.is_none()
             && self.port_drag.is_none()
-            && response.drag_started()
+            && response.drag_started_by(egui::PointerButton::Primary)
         {
             if let Some(press_pos) = ui.input(|i| i.pointer.press_origin()) {
-                if !middle_down {
-                    if let Some(src_port) = self.hit_test_port(&visible_nodes, press_pos, origin) {
-                        if shift_held {
-                            let world_pos = self.screen_to_world(press_pos, origin);
-                            self.wire_draft = Some(WireDraft {
-                                source: src_port,
-                                current_world: world_pos,
-                                hovered_target: None,
-                            });
-                        } else {
-                            let node_key = src_port.node_path.canonical_key();
-                            if let Some(pnode) = layout.nodes.get(&node_key) {
-                                self.selected = Some(src_port.node_path.clone());
-                                self.selected_edge = None;
-                                self.port_drag = Some(PortDragState {
-                                    node_key,
-                                    port_name: src_port.port_name,
-                                    node_rect: pnode.rect,
-                                });
-                                action = Some(CanvasAction::SelectNode {
-                                    path: src_port.node_path,
-                                });
-                            }
-                        }
-                    } else if let Some(handle_src) =
-                        self.hit_test_selection_handle(layout, press_pos, origin)
-                    {
+                if let Some((rnode, corner)) =
+                    self.hit_test_resize_handle(layout, press_pos, origin)
+                {
+                    self.node_resize = Some(NodeResizeState {
+                        node_key: rnode.path.canonical_key(),
+                        corner,
+                        orig_rect: rnode.rect,
+                    });
+                } else if let Some(src_port) = self.hit_test_port(&visible_nodes, press_pos, origin) {
+                    if shift_held {
                         let world_pos = self.screen_to_world(press_pos, origin);
-                        self.handle_drag = Some(NodeHandleDrag {
-                            source_path: handle_src.path.clone(),
-                            source_label: handle_src.label.clone(),
-                            source_shape: handle_src.shape,
-                            start_world: world_pos,
+                        self.wire_draft = Some(WireDraft {
+                            source: src_port,
                             current_world: world_pos,
                             hovered_target: None,
                         });
-                    } else if active_tool.is_none() && self.rel_pick.is_none() {
-                        if let Some(hit_node) = Self::hit_test_node_static(
-                            self.pan,
-                            self.zoom,
-                            &visible_nodes,
-                            press_pos,
-                            origin,
-                        ) {
-                            let primary_key = hit_node.path.canonical_key();
-                            let prefix = format!("{primary_key}/");
-                            let mut dragged_keys = vec![primary_key.clone()];
-                            for k in layout.nodes.keys() {
-                                if k.starts_with(&prefix) {
-                                    dragged_keys.push(k.clone());
-                                }
-                            }
-                            self.selected = Some(hit_node.path.clone());
+                    } else {
+                        let node_key = src_port.node_path.canonical_key();
+                        if let Some(pnode) = layout.nodes.get(&node_key) {
+                            self.selected = None;
+                            self.selected_port = Some((node_key.clone(), src_port.port_name.clone()));
                             self.selected_edge = None;
-                            self.node_drag = Some(NodeDragState {
-                                primary_key,
-                                dragged_keys,
-                                last_world: self.screen_to_world(press_pos, origin),
-                                alignment_x: None,
-                                alignment_y: None,
+                            self.port_drag = Some(PortDragState {
+                                node_key,
+                                port_name: src_port.port_name.clone(),
+                                node_rect: pnode.rect,
+                                press_screen: press_pos,
+                                activated: false,
                             });
-                            action = Some(CanvasAction::SelectNode {
-                                path: hit_node.path.clone(),
+                            action = Some(CanvasAction::SelectPort {
+                                node_path: src_port.node_path,
+                                node_label: src_port.node_label,
+                                port_name: src_port.port_name,
                             });
                         }
+                    }
+                } else if let Some(handle_src) =
+                    self.hit_test_selection_handle(layout, press_pos, origin)
+                {
+                    let world_pos = self.screen_to_world(press_pos, origin);
+                    self.handle_drag = Some(NodeHandleDrag {
+                        source_path: handle_src.path.clone(),
+                        source_label: handle_src.label.clone(),
+                        source_shape: handle_src.shape,
+                        start_world: world_pos,
+                        current_world: world_pos,
+                        hovered_target: None,
+                    });
+                } else if active_tool.is_none() && self.rel_pick.is_none() {
+                    if let Some(hit_node) = Self::hit_test_node_static(
+                        self.pan,
+                        self.zoom,
+                        &visible_nodes,
+                        press_pos,
+                        origin,
+                    ) {
+                        let primary_key = hit_node.path.canonical_key();
+                        let prefix = format!("{primary_key}/");
+                        let mut dragged_keys = vec![primary_key.clone()];
+                        for k in layout.nodes.keys() {
+                            if k.starts_with(&prefix) {
+                                dragged_keys.push(k.clone());
+                            }
+                        }
+                        self.selected = Some(hit_node.path.clone());
+                        self.selected_edge = None;
+                        self.node_drag = Some(NodeDragState {
+                            primary_key,
+                            dragged_keys,
+                            press_screen: press_pos,
+                            last_world: self.screen_to_world(press_pos, origin),
+                            activated: false,
+                            alignment_x: None,
+                            alignment_y: None,
+                        });
+                        action = Some(CanvasAction::SelectNode {
+                            path: hit_node.path.clone(),
+                        });
                     }
                 }
             }
@@ -622,24 +697,88 @@ impl DiagramCanvas {
         let pan = self.pan;
         let zoom = self.zoom;
 
-        if self.port_drag.is_some() {
+        if let Some(ref rstate) = self.node_resize {
+            let icon = match rstate.corner {
+                ResizeCorner::TopLeft | ResizeCorner::BottomRight => egui::CursorIcon::ResizeNwSe,
+                ResizeCorner::TopRight | ResizeCorner::BottomLeft => egui::CursorIcon::ResizeNeSw,
+            };
+            ui.ctx().set_cursor_icon(icon);
+        } else if self.port_drag.as_ref().is_some_and(|d| d.activated) {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
         } else if response.hovered() {
             if let Some(ptr) = ui.input(|i| i.pointer.hover_pos()) {
-                if Self::hit_test_port_static(pan, zoom, &visible_nodes, ptr, origin).is_some() {
+                if let Some((_, corner)) = self.hit_test_resize_handle(layout, ptr, origin) {
+                    let icon = match corner {
+                        ResizeCorner::TopLeft | ResizeCorner::BottomRight => {
+                            egui::CursorIcon::ResizeNwSe
+                        }
+                        ResizeCorner::TopRight | ResizeCorner::BottomLeft => {
+                            egui::CursorIcon::ResizeNeSw
+                        }
+                    };
+                    ui.ctx().set_cursor_icon(icon);
+                } else if Self::hit_test_port_static(pan, zoom, &visible_nodes, ptr, origin)
+                    .is_some()
+                {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
                 }
             }
         }
 
-        if let Some(ref pdrag) = self.port_drag.clone() {
+        const DRAG_DEADZONE_PX: f32 = 4.0;
+        if let Some(ref rstate) = self.node_resize.clone() {
             if let Some(world_ptr) = pointer_world {
-                let placement = project_point_to_border(world_ptr, pdrag.node_rect);
-                action = Some(CanvasAction::MovePort {
-                    node_key: pdrag.node_key.clone(),
-                    port_name: pdrag.port_name.clone(),
-                    placement: Some(placement),
+                let o = rstate.orig_rect;
+                let right = o.x + o.w;
+                let bottom = o.y + o.h;
+                let (raw_w, raw_h, anchor_x, anchor_y, anchor_right, anchor_bottom) =
+                    match rstate.corner {
+                        ResizeCorner::BottomRight => {
+                            (world_ptr.x - o.x, world_ptr.y - o.y, o.x, o.y, false, false)
+                        }
+                        ResizeCorner::BottomLeft => {
+                            (right - world_ptr.x, world_ptr.y - o.y, right, o.y, true, false)
+                        }
+                        ResizeCorner::TopRight => {
+                            (world_ptr.x - o.x, bottom - world_ptr.y, o.x, bottom, false, true)
+                        }
+                        ResizeCorner::TopLeft => (
+                            right - world_ptr.x,
+                            bottom - world_ptr.y,
+                            right,
+                            bottom,
+                            true,
+                            true,
+                        ),
+                    };
+                action = Some(CanvasAction::ResizeNode {
+                    node_key: rstate.node_key.clone(),
+                    width: raw_w.clamp(80.0, 900.0),
+                    height: raw_h.clamp(36.0, 700.0),
+                    anchor_x,
+                    anchor_y,
+                    anchor_right,
+                    anchor_bottom,
                 });
+            }
+            if response.drag_stopped() || ui.input(|i| i.pointer.any_released()) {
+                self.node_resize = None;
+            }
+        } else if let Some(ref mut pdrag) = self.port_drag {
+            if let Some(screen_ptr) = pointer_interact {
+                if !pdrag.activated && screen_ptr.distance(pdrag.press_screen) >= DRAG_DEADZONE_PX {
+                    pdrag.activated = true;
+                }
+                if pdrag.activated {
+                    if let Some(world_ptr) = pointer_world {
+                        let placement = project_point_to_border(world_ptr, pdrag.node_rect);
+                        action = Some(CanvasAction::MovePort {
+                            node_key: pdrag.node_key.clone(),
+                            port_name: pdrag.port_name.clone(),
+                            placement: Some(placement),
+                        });
+                    }
+                }
             }
             if response.drag_stopped() || ui.input(|i| i.pointer.any_released()) {
                 self.port_drag = None;
@@ -742,45 +881,57 @@ impl DiagramCanvas {
                 }
             }
         } else if let Some(ref mut ndrag) = self.node_drag {
-            if let Some(world_ptr) = pointer_world {
-                let mut dx = world_ptr.x - ndrag.last_world.x;
-                let mut dy = world_ptr.y - ndrag.last_world.y;
-                ndrag.alignment_x = None;
-                ndrag.alignment_y = None;
+            if !ndrag.activated {
+                if let Some(screen_ptr) = pointer_interact {
+                    if screen_ptr.distance(ndrag.press_screen) >= DRAG_DEADZONE_PX {
+                        ndrag.activated = true;
+                    }
+                }
+            }
+            if ndrag.activated {
+                if let Some(world_ptr) = pointer_world {
+                    let mut dx = world_ptr.x - ndrag.last_world.x;
+                    let mut dy = world_ptr.y - ndrag.last_world.y;
+                    ndrag.alignment_x = None;
+                    ndrag.alignment_y = None;
 
-                if dx.abs() > 0.05 || dy.abs() > 0.05 {
-                    if let Some(primary) = layout.nodes.get(&ndrag.primary_key) {
-                        let cand_cx = primary.rect.x + primary.rect.w * 0.5 + dx;
-                        let cand_cy = primary.rect.y + primary.rect.h * 0.5 + dy;
-                        for (okey, other) in &layout.nodes {
-                            if ndrag.dragged_keys.contains(okey) {
-                                continue;
-                            }
-                            let ocx = other.rect.x + other.rect.w * 0.5;
-                            let ocy = other.rect.y + other.rect.h * 0.5;
-                            if (cand_cx - ocx).abs() < 6.0 && ndrag.alignment_x.is_none() {
-                                dx += ocx - cand_cx;
-                                ndrag.alignment_x = Some(ocx);
-                            }
-                            if (cand_cy - ocy).abs() < 6.0 && ndrag.alignment_y.is_none() {
-                                dy += ocy - cand_cy;
-                                ndrag.alignment_y = Some(ocy);
+                    if dx.abs() > 0.05 || dy.abs() > 0.05 {
+                        if let Some(primary) = layout.nodes.get(&ndrag.primary_key) {
+                            let cand_cx = primary.rect.x + primary.rect.w * 0.5 + dx;
+                            let cand_cy = primary.rect.y + primary.rect.h * 0.5 + dy;
+                            for (okey, other) in &layout.nodes {
+                                if ndrag.dragged_keys.contains(okey) {
+                                    continue;
+                                }
+                                let ocx = other.rect.x + other.rect.w * 0.5;
+                                let ocy = other.rect.y + other.rect.h * 0.5;
+                                if (cand_cx - ocx).abs() < 6.0 && ndrag.alignment_x.is_none() {
+                                    dx += ocx - cand_cx;
+                                    ndrag.alignment_x = Some(ocx);
+                                }
+                                if (cand_cy - ocy).abs() < 6.0 && ndrag.alignment_y.is_none() {
+                                    dy += ocy - cand_cy;
+                                    ndrag.alignment_y = Some(ocy);
+                                }
                             }
                         }
+                        ndrag.last_world =
+                            Pos2::new(ndrag.last_world.x + dx, ndrag.last_world.y + dy);
+                        let deltas = ndrag
+                            .dragged_keys
+                            .iter()
+                            .map(|k| (k.clone(), dx, dy))
+                            .collect();
+                        action = Some(CanvasAction::MoveNodes { deltas });
                     }
-                    ndrag.last_world = Pos2::new(ndrag.last_world.x + dx, ndrag.last_world.y + dy);
-                    let deltas = ndrag
-                        .dragged_keys
-                        .iter()
-                        .map(|k| (k.clone(), dx, dy))
-                        .collect();
-                    action = Some(CanvasAction::MoveNodes { deltas });
                 }
             }
             if response.drag_stopped() || ui.input(|i| i.pointer.any_released()) {
                 self.node_drag = None;
             }
-        } else if response.dragged() {
+        } else if response.dragged_by(egui::PointerButton::Primary)
+            || response.dragged_by(egui::PointerButton::Middle)
+        {
             self.pan += response.drag_delta();
         }
 
@@ -910,10 +1061,15 @@ impl DiagramCanvas {
                         .and_then(|p| meta_by_key.get(&p.canonical_key()))
                         .map(|m| m.source_file.clone())
                         .unwrap_or_else(|| active_file.to_string());
+                    let world_pos = {
+                        let w = self.screen_to_world(cp, origin);
+                        Some(syssur_layout::Point2 { x: w.x, y: w.y })
+                    };
                     action = Some(CanvasAction::PlaceCatalogItem {
                         item: tool,
                         container: hit_container,
                         file,
+                        world_pos,
                     });
                     *active_tool = None;
                 }
@@ -922,15 +1078,17 @@ impl DiagramCanvas {
 
         if response.secondary_clicked() {
             if let Some(rc_pos) = response.interact_pointer_pos() {
+                self.context_world_pos = Some(self.screen_to_world(rc_pos, origin));
                 if let Some(port_ep) = self.hit_test_port(&visible_nodes, rc_pos, origin) {
                     let node_key = port_ep.node_path.canonical_key();
                     let file = meta_by_key
                         .get(&node_key)
                         .map(|m| m.source_file.clone())
                         .unwrap_or_else(|| active_file.to_string());
-                    self.context_port = Some((node_key, port_ep.port_name, file));
+                    self.context_port = Some((node_key.clone(), port_ep.port_name.clone(), file));
                     self.context_node = None;
-                    self.selected = Some(port_ep.node_path);
+                    self.selected = None;
+                    self.selected_port = Some((node_key, port_ep.port_name));
                     self.selected_edge = None;
                 } else {
                     self.context_port = None;
@@ -954,8 +1112,19 @@ impl DiagramCanvas {
         // Partition visible nodes into compound containers vs leaf blocks so edges NEVER draw over leaf blocks.
         let mut container_nodes: Vec<&PositionedNode> = Vec::new();
         let mut leaf_nodes: Vec<&PositionedNode> = Vec::new();
-        let mut hit_node_this_click = None;
+        let mut hit_port_this_click = click_pos.and_then(|cp| {
+            if action.is_none() && active_tool.is_none() && self.rel_pick.is_none() {
+                self.hit_test_port(&visible_nodes, cp, origin)
+            } else {
+                None
+            }
+        });
+        let mut hit_leaf_this_click = None;
+        let mut hit_container_this_click = None;
         for &node in &visible_nodes {
+            let is_container = visible_nodes.iter().any(|other| {
+                other.path != node.path && other.path.parent().as_ref() == Some(&node.path)
+            });
             let screen_rect = Rect::from_min_size(
                 self.world_to_screen(Pos2::new(node.rect.x, node.rect.y), origin),
                 Vec2::new(node.rect.w * self.zoom, node.rect.h * self.zoom),
@@ -964,14 +1133,16 @@ impl DiagramCanvas {
                 if action.is_none()
                     && active_tool.is_none()
                     && self.rel_pick.is_none()
+                    && hit_port_this_click.is_none()
                     && screen_rect.contains(cp)
                 {
-                    hit_node_this_click = Some(node.path.clone());
+                    if is_container {
+                        hit_container_this_click = Some(node.path.clone());
+                    } else {
+                        hit_leaf_this_click = Some(node.path.clone());
+                    }
                 }
             }
-            let is_container = visible_nodes.iter().any(|other| {
-                other.path != node.path && other.path.parent().as_ref() == Some(&node.path)
-            });
             if is_container {
                 container_nodes.push(node);
             } else {
@@ -1016,7 +1187,8 @@ impl DiagramCanvas {
                 if action.is_none()
                     && active_tool.is_none()
                     && self.rel_pick.is_none()
-                    && hit_node_this_click.is_none()
+                    && hit_port_this_click.is_none()
+                    && hit_leaf_this_click.is_none()
                     && self.hit_test_edge(edge, cp, origin)
                 {
                     hit_edge_this_click = Some(idx);
@@ -1067,18 +1239,47 @@ impl DiagramCanvas {
             }
         }
 
-        if let Some(path) = hit_node_this_click {
+        if let Some(port_ep) = hit_port_this_click.take() {
+            let node_key = port_ep.node_path.canonical_key();
+            self.selected = None;
+            self.selected_port = Some((node_key, port_ep.port_name.clone()));
+            self.selected_edge = None;
+            if action.is_none() {
+                action = Some(CanvasAction::SelectPort {
+                    node_path: port_ep.node_path,
+                    node_label: port_ep.node_label,
+                    port_name: port_ep.port_name,
+                });
+            }
+        } else if let Some(path) = hit_leaf_this_click {
             self.selected = Some(path.clone());
+            self.selected_port = None;
             self.selected_edge = None;
             if action.is_none() {
                 action = Some(CanvasAction::SelectNode { path });
             }
         } else if let Some(edge_idx) = hit_edge_this_click {
             self.selected = None;
+            self.selected_port = None;
             self.selected_edge = Some(edge_idx);
             if action.is_none() {
                 action = Some(CanvasAction::SelectEdge { index: edge_idx });
             }
+        } else if let Some(path) = hit_container_this_click {
+            self.selected = Some(path.clone());
+            self.selected_port = None;
+            self.selected_edge = None;
+            if action.is_none() {
+                action = Some(CanvasAction::SelectNode { path });
+            }
+        } else if click_pos.is_some()
+            && action.is_none()
+            && active_tool.is_none()
+            && self.rel_pick.is_none()
+        {
+            self.selected = None;
+            self.selected_port = None;
+            self.selected_edge = None;
         }
 
         if let Some(ref sel_path) = self.selected {
@@ -1141,7 +1342,9 @@ impl DiagramCanvas {
         }
 
         // Clean, non-convoluted nested Clause 7 right-click contextual menu (Port vs Node vs Canvas)
-        response.context_menu(|ui| {
+        egui::Popup::context_menu(&response)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
             if let Some((node_key, port_name, port_file)) = self.context_port.clone() {
                 ui.set_min_width(220.0);
                 ui.label(RichText::new(format!("Port: {port_name}")).strong());
@@ -1249,12 +1452,16 @@ impl DiagramCanvas {
                         .map(|l| l.short_name().to_string())
                         .unwrap_or_else(|| node.label.clone());
 
+                    let ctx_world = self
+                        .context_world_pos
+                        .map(|w| syssur_layout::Point2 { x: w.x, y: w.y });
                     if !q.is_empty() {
                         if let Some(item) = show_create_submenus(ui, &q) {
                             action = Some(CanvasAction::PlaceCatalogItem {
                                 item,
                                 container: Some(ctx_path.clone()),
                                 file: file.clone(),
+                                world_pos: ctx_world,
                             });
                             ui.close();
                         }
@@ -1265,19 +1472,16 @@ impl DiagramCanvas {
                                     item,
                                     container: Some(ctx_path.clone()),
                                     file: file.clone(),
+                                    world_pos: ctx_world,
                                 });
                                 ui.close();
                             }
                         });
 
                         ui.menu_button("Connect / Relate...", |ui| {
-                            ui.set_min_width(200.0);
+                            ui.set_min_width(220.0);
                             for rel in catalog_relationships() {
-                                if ui
-                                    .button(rel.label)
-                                    .on_hover_text(rel.doc_hint)
-                                    .clicked()
-                                {
+                                if catalog_item_row(ui, rel, false, false).clicked() {
                                     self.rel_pick = Some(RelationshipPickState {
                                         rel_keyword: rel.keyword,
                                         rel_label: rel.label,
@@ -1437,6 +1641,14 @@ impl DiagramCanvas {
                             ui.close();
                         }
                     }
+                    if (q.is_empty() || "resize".contains(&q) || "size".contains(&q))
+                        && ui.button("Reset Block Size (Auto)").clicked()
+                    {
+                        action = Some(CanvasAction::ResetNodeSize {
+                            node_key: key.clone(),
+                        });
+                        ui.close();
+                    }
                     if let Some(leaf) = ctx_path.leaf().cloned() {
                         if (q.is_empty() || "rename".contains(&q))
                             && ui.button(tr(locale, TextKey::CtxRenameElement)).clicked()
@@ -1477,12 +1689,16 @@ impl DiagramCanvas {
                 }
             } else {
                 // Empty canvas context menu
+                let ctx_world = self
+                    .context_world_pos
+                    .map(|w| syssur_layout::Point2 { x: w.x, y: w.y });
                 if !q.is_empty() {
                     if let Some(item) = show_create_submenus(ui, &q) {
                         action = Some(CanvasAction::PlaceCatalogItem {
                             item,
                             container: None,
                             file: active_file.to_string(),
+                            world_pos: ctx_world,
                         });
                         ui.close();
                     }
@@ -1493,6 +1709,7 @@ impl DiagramCanvas {
                                 item,
                                 container: None,
                                 file: active_file.to_string(),
+                                world_pos: ctx_world,
                             });
                             ui.close();
                         }
@@ -1557,7 +1774,66 @@ impl DiagramCanvas {
         ]
     }
 
+    fn is_resizable_shape(shape: NodeShape) -> bool {
+        matches!(
+            shape,
+            NodeShape::PartBlock
+                | NodeShape::ActionBox
+                | NodeShape::StateBox
+                | NodeShape::RequirementCard
+                | NodeShape::ConstraintCard
+                | NodeShape::CaseOval
+                | NodeShape::GenericElement
+        )
+    }
+
+    fn resize_handle_positions(
+        &self,
+        node: &PositionedNode,
+        origin: Pos2,
+    ) -> [(ResizeCorner, Pos2); 4] {
+        let rect = Rect::from_min_size(
+            self.world_to_screen(Pos2::new(node.rect.x, node.rect.y), origin),
+            Vec2::new(node.rect.w * self.zoom, node.rect.h * self.zoom),
+        );
+        [
+            (ResizeCorner::TopLeft, rect.left_top()),
+            (ResizeCorner::TopRight, rect.right_top()),
+            (ResizeCorner::BottomRight, rect.right_bottom()),
+            (ResizeCorner::BottomLeft, rect.left_bottom()),
+        ]
+    }
+
+    fn hit_test_resize_handle<'a>(
+        &self,
+        layout: &'a LayoutOutput,
+        screen_pos: Pos2,
+        origin: Pos2,
+    ) -> Option<(&'a PositionedNode, ResizeCorner)> {
+        let sel = self.selected.as_ref()?;
+        let node = layout.nodes.get(&sel.canonical_key())?;
+        if !Self::is_resizable_shape(node.shape) {
+            return None;
+        }
+        self.resize_handle_positions(node, origin)
+            .into_iter()
+            .find(|(_, pos)| pos.distance(screen_pos) <= 8.0)
+            .map(|(corner, _)| (node, corner))
+    }
+
     fn paint_selection_handles(&self, painter: &egui::Painter, node: &PositionedNode, origin: Pos2) {
+        if Self::is_resizable_shape(node.shape) {
+            for (_, corner_pos) in self.resize_handle_positions(node, origin) {
+                let hrect = Rect::from_center_size(corner_pos, Vec2::splat(7.0));
+                painter.rect_filled(hrect, 1.5, Color32::from_rgb(235, 245, 255));
+                painter.rect_stroke(
+                    hrect,
+                    1.5,
+                    Stroke::new(1.3, Color32::from_rgb(70, 155, 235)),
+                    StrokeKind::Outside,
+                );
+            }
+        }
         let handles = self.selection_handle_positions(node, origin);
         let dirs = [
             Vec2::new(0.0, -1.0),
@@ -1619,7 +1895,7 @@ impl DiagramCanvas {
             .map(|w| self.world_to_screen(Pos2::new(w.x, w.y), origin))
             .collect();
         for seg in pts.windows(2) {
-            if point_segment_distance(screen_pos, seg[0], seg[1]) <= 7.0 {
+            if point_segment_distance(screen_pos, seg[0], seg[1]) <= 9.0 {
                 return true;
             }
         }
@@ -1872,7 +2148,12 @@ impl DiagramCanvas {
                 return;
             }
             NodeShape::StateBox => {
-                let radius = CornerRadius::same((16.0 * self.zoom).clamp(6.0, 20.0) as u8);
+                let is_def = meta.is_some_and(|m| m.is_def);
+                let radius = if is_def {
+                    CornerRadius::ZERO
+                } else {
+                    CornerRadius::same((14.0 * self.zoom).clamp(5.0, 18.0) as u8)
+                };
                 let fill = if is_container {
                     Color32::from_rgba_unmultiplied(38, 30, 56, 220)
                 } else {
@@ -1891,10 +2172,21 @@ impl DiagramCanvas {
                     StrokeKind::Inside,
                 );
                 if lod != RenderLod::Macro {
+                    let stereo = meta
+                        .map(|m| m.stereotype.as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(if is_def { "«state def»" } else { "«state»" });
                     painter.text(
-                        rect.left_top() + Vec2::new(10.0 * self.zoom, 7.0 * self.zoom),
-                        Align2::LEFT_TOP,
-                        format!("«state» {}", node.label),
+                        Pos2::new(rect.center().x, rect.top() + 5.0 * self.zoom),
+                        Align2::CENTER_TOP,
+                        stereo,
+                        FontId::proportional((10.5 * self.zoom).clamp(8.5, 13.0)),
+                        Color32::from_rgb(200, 175, 250),
+                    );
+                    painter.text(
+                        Pos2::new(rect.center().x, rect.top() + 19.0 * self.zoom),
+                        Align2::CENTER_TOP,
+                        &node.label,
                         FontId::proportional((13.0 * self.zoom).clamp(9.5, 18.0)),
                         Color32::from_rgb(235, 225, 255),
                     );
@@ -1902,20 +2194,37 @@ impl DiagramCanvas {
                 return;
             }
             NodeShape::RequirementCard | NodeShape::ConstraintCard => {
-                let radius = CornerRadius::same((6.0 * self.zoom).clamp(2.0, 8.0) as u8);
-                let (fill, accent, stereo) = if node.shape == NodeShape::ConstraintCard {
+                let is_def = meta.is_some_and(|m| m.is_def);
+                let radius = if is_def {
+                    CornerRadius::ZERO
+                } else {
+                    CornerRadius::same((10.0 * self.zoom).clamp(4.0, 13.0) as u8)
+                };
+                let (fill, accent, default_stereo) = if node.shape == NodeShape::ConstraintCard {
                     (
                         Color32::from_rgb(36, 44, 40),
                         Color32::from_rgb(135, 215, 175),
-                        "«constraint»",
+                        if is_def {
+                            "«constraint def»"
+                        } else {
+                            "«constraint»"
+                        },
                     )
                 } else {
                     (
                         Color32::from_rgb(46, 40, 30),
                         Color32::from_rgb(235, 185, 80),
-                        "«requirement»",
+                        if is_def {
+                            "«requirement def»"
+                        } else {
+                            "«requirement»"
+                        },
                     )
                 };
+                let stereo = meta
+                    .map(|m| m.stereotype.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(default_stereo);
                 painter.rect_filled(rect, radius, fill);
                 painter.rect_stroke(
                     rect,
@@ -1934,25 +2243,30 @@ impl DiagramCanvas {
                     .map(|id| format!("<{id}> "))
                     .unwrap_or_default();
                 painter.text(
-                    rect.left_top() + Vec2::new(8.0 * self.zoom, 5.0 * self.zoom),
-                    Align2::LEFT_TOP,
+                    Pos2::new(rect.center().x, rect.top() + 5.0 * self.zoom),
+                    Align2::CENTER_TOP,
                     stereo,
-                    FontId::monospace((10.5 * self.zoom).clamp(8.5, 13.0)),
+                    FontId::proportional((10.5 * self.zoom).clamp(8.5, 13.0)),
                     accent,
                 );
                 painter.text(
-                    rect.left_top() + Vec2::new(8.0 * self.zoom, 20.0 * self.zoom),
-                    Align2::LEFT_TOP,
+                    Pos2::new(rect.center().x, rect.top() + 19.0 * self.zoom),
+                    Align2::CENTER_TOP,
                     format!("{id_badge}{}", node.label),
                     FontId::proportional((13.5 * self.zoom).clamp(9.5, 18.0)),
                     Color32::from_gray(242),
                 );
                 if lod == RenderLod::Micro {
                     if let Some(doc) = meta.and_then(|m| m.doc.as_deref()) {
+                        let div_y = rect.top() + 37.0 * self.zoom;
+                        painter.line_segment(
+                            [Pos2::new(rect.left(), div_y), Pos2::new(rect.right(), div_y)],
+                            Stroke::new(1.0, Color32::from_rgba_unmultiplied(180, 180, 180, 65)),
+                        );
                         let snippet: String = doc.chars().take(46).collect();
                         let suffix = if doc.chars().count() > 46 { "..." } else { "" };
                         painter.text(
-                            rect.left_top() + Vec2::new(8.0 * self.zoom, 39.0 * self.zoom),
+                            rect.left_top() + Vec2::new(8.0 * self.zoom, 41.0 * self.zoom),
                             Align2::LEFT_TOP,
                             format!("{snippet}{suffix}"),
                             FontId::proportional((11.0 * self.zoom).clamp(8.5, 14.0)),
@@ -2001,7 +2315,12 @@ impl DiagramCanvas {
                 return;
             }
             NodeShape::GenericElement => {
-                let radius = CornerRadius::same(5);
+                let is_def = meta.is_some_and(|m| m.is_def);
+                let radius = if is_def {
+                    CornerRadius::ZERO
+                } else {
+                    CornerRadius::same((10.0 * self.zoom).clamp(4.0, 13.0) as u8)
+                };
                 painter.rect_filled(rect, radius, Color32::from_rgb(35, 39, 48));
                 painter.rect_stroke(
                     rect,
@@ -2022,10 +2341,10 @@ impl DiagramCanvas {
                         .filter(|s| !s.is_empty())
                         .unwrap_or("«element»");
                     painter.text(
-                        rect.left_top() + Vec2::new(8.0 * self.zoom, 5.0 * self.zoom),
-                        Align2::LEFT_TOP,
+                        Pos2::new(rect.center().x, rect.top() + 5.0 * self.zoom),
+                        Align2::CENTER_TOP,
                         stereo,
-                        FontId::monospace((10.0 * self.zoom).clamp(8.0, 12.5)),
+                        FontId::proportional((10.5 * self.zoom).clamp(8.5, 12.5)),
                         Color32::from_rgb(160, 185, 220),
                     );
                     let title = match meta.and_then(|m| m.type_name.as_deref()) {
@@ -2033,8 +2352,8 @@ impl DiagramCanvas {
                         None => node.label.clone(),
                     };
                     painter.text(
-                        rect.left_top() + Vec2::new(8.0 * self.zoom, 20.0 * self.zoom),
-                        Align2::LEFT_TOP,
+                        Pos2::new(rect.center().x, rect.top() + 19.0 * self.zoom),
+                        Align2::CENTER_TOP,
                         title,
                         FontId::proportional((13.0 * self.zoom).clamp(9.5, 17.0)),
                         Color32::from_gray(236),
@@ -2045,7 +2364,9 @@ impl DiagramCanvas {
             NodeShape::PartBlock => {}
         }
 
-        // PartBlock rendering
+        // SysML v2 Table 4 PartBlock rendering:
+        // Sharp square corners for definitions (`part def`), rounded corners for usages (`part`).
+        let is_def = meta.is_some_and(|m| m.is_def);
         let origin_kind = meta.map(|m| &m.origin);
         let is_inherited = matches!(origin_kind, Some(FeatureOrigin::Inherited(_)));
 
@@ -2066,11 +2387,16 @@ impl DiagramCanvas {
             Color32::from_rgb(86, 102, 124)
         };
 
-        painter.rect_filled(rect, 6.0 * self.zoom.min(1.0), fill);
+        let radius = if is_def {
+            CornerRadius::ZERO
+        } else {
+            CornerRadius::same((11.0 * self.zoom).clamp(4.0, 14.0) as u8)
+        };
+        painter.rect_filled(rect, radius, fill);
         painter.rect_stroke(
             rect,
-            6.0 * self.zoom.min(1.0),
-            Stroke::new(if selected { 2.2 } else { 1.2 }, border_color),
+            radius,
+            Stroke::new(if selected { 2.2 } else { 1.3 }, border_color),
             StrokeKind::Inside,
         );
 
@@ -2078,52 +2404,121 @@ impl DiagramCanvas {
             return;
         }
 
-        let badge = match origin_kind {
-            Some(FeatureOrigin::Inherited(_)) => "^ ",
-            Some(FeatureOrigin::Subsetted(_)) => ":> ",
-            Some(FeatureOrigin::Redefined(_)) => ":>> ",
-            _ => "",
-        };
-
-        let header_color = if is_inherited {
-            Color32::from_gray(165)
+        // Line 1: Centered SysML v2 stereotype guillemets («part def», «abstract part def», «part», ...)
+        let stereo = meta
+            .map(|m| m.stereotype.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(if is_def { "«part def»" } else { "«part»" });
+        let stereo_color = if is_def {
+            Color32::from_rgb(155, 195, 235)
         } else {
-            Color32::from_gray(238)
+            Color32::from_rgb(175, 205, 195)
         };
-
-        let title = if let Some(tn) = meta.and_then(|m| m.type_name.as_deref()) {
-            format!("{badge}{} : {tn}", node.label)
-        } else {
-            format!("{badge}{}", node.label)
-        };
-
         painter.text(
-            rect.left_top() + Vec2::new(8.0 * self.zoom, 6.0 * self.zoom),
-            Align2::LEFT_TOP,
-            title,
-            FontId::proportional((14.0 * self.zoom).clamp(10.0, 20.0)),
+            Pos2::new(rect.center().x, rect.top() + 5.0 * self.zoom),
+            Align2::CENTER_TOP,
+            stereo,
+            FontId::proportional((10.5 * self.zoom).clamp(8.5, 13.0)),
+            stereo_color,
+        );
+
+        // Line 2: Centered Name Compartment header (<shortId> ^name : Type [mult] or Name :> Super)
+        let short_badge = meta
+            .and_then(|m| m.short_id.as_deref())
+            .map(|s| format!("<{s}> "))
+            .unwrap_or_default();
+        let inh_prefix = if is_inherited { "^" } else { "" };
+        let type_or_spec = if is_def {
+            meta.and_then(|m| m.specializes.as_deref())
+                .map(|sp| format!(" :> {sp}"))
+                .unwrap_or_default()
+        } else {
+            meta.and_then(|m| m.type_name.as_deref())
+                .map(|tn| format!(" : {tn}"))
+                .unwrap_or_default()
+        };
+        let mult_suffix = meta
+            .and_then(|m| m.multiplicity)
+            .map(|m| format!(" [{m}]"))
+            .unwrap_or_default();
+        let header_line = format!(
+            "{short_badge}{inh_prefix}{}{type_or_spec}{mult_suffix}",
+            node.label
+        );
+        let header_color = if is_inherited {
+            Color32::from_gray(175)
+        } else {
+            Color32::from_gray(242)
+        };
+        painter.text(
+            Pos2::new(rect.center().x, rect.top() + 19.0 * self.zoom),
+            Align2::CENTER_TOP,
+            header_line,
+            FontId::proportional((13.5 * self.zoom).clamp(10.0, 19.0)),
             header_color,
         );
 
-        if lod == RenderLod::Mid {
-            return;
+        // Line 3 (optional): Subsets / Redefines subtitle
+        let origin_sub = match origin_kind {
+            Some(FeatureOrigin::Subsetted(t)) => Some(format!("subsets {}", t.short_name())),
+            Some(FeatureOrigin::Redefined(t)) => Some(format!("redefines {}", t.short_name())),
+            _ => None,
+        };
+        if let Some(ref sub) = origin_sub {
+            painter.text(
+                Pos2::new(rect.center().x, rect.top() + 36.0 * self.zoom),
+                Align2::CENTER_TOP,
+                sub,
+                FontId::proportional((10.5 * self.zoom).clamp(8.5, 13.0)),
+                Color32::from_rgb(175, 200, 185),
+            );
         }
 
-        if let Some(m) = meta {
-            let mut y_off = 28.0 * self.zoom;
-            for attr in m.attributes.iter().take(3) {
-                painter.text(
-                    rect.left_top() + Vec2::new(10.0 * self.zoom, y_off),
-                    Align2::LEFT_TOP,
-                    attr,
-                    FontId::monospace((12.0 * self.zoom).clamp(9.0, 16.0)),
-                    Color32::from_gray(185),
+        let name_comp_h = if origin_sub.is_some() { 52.0 } else { 38.0 };
+        let attrs = meta.map(|m| m.attributes.as_slice()).unwrap_or(&[]);
+
+        if lod == RenderLod::Micro {
+            // Horizontal compartment divider separating Name Compartment from compartments below
+            if is_container || !attrs.is_empty() {
+                let div_y = (rect.top() + name_comp_h * self.zoom).min(rect.bottom() - 4.0);
+                painter.line_segment(
+                    [Pos2::new(rect.left(), div_y), Pos2::new(rect.right(), div_y)],
+                    Stroke::new(1.0, border_color),
                 );
-                y_off += 16.0 * self.zoom;
+            }
+
+            if !attrs.is_empty() {
+                let div_y = rect.top() + name_comp_h * self.zoom;
+                painter.text(
+                    Pos2::new(rect.center().x, div_y + 3.0 * self.zoom),
+                    Align2::CENTER_TOP,
+                    "attributes",
+                    FontId::proportional((10.5 * self.zoom).clamp(8.5, 13.0)),
+                    Color32::from_gray(165),
+                );
+                let mut y_off = div_y + 18.0 * self.zoom;
+                for attr in attrs.iter().take(8) {
+                    if y_off + 12.0 * self.zoom > rect.bottom() {
+                        break;
+                    }
+                    let attr_col = if attr.starts_with('^') {
+                        Color32::from_gray(155)
+                    } else {
+                        Color32::from_gray(205)
+                    };
+                    painter.text(
+                        Pos2::new(rect.left() + 8.0 * self.zoom, y_off),
+                        Align2::LEFT_TOP,
+                        attr,
+                        FontId::monospace((11.5 * self.zoom).clamp(8.5, 15.0)),
+                        attr_col,
+                    );
+                    y_off += 15.0 * self.zoom;
+                }
             }
         }
 
-        if paint_ports {
+        if lod == RenderLod::Micro && paint_ports {
             let nkey = node.path.canonical_key();
             for port in &node.ports {
                 self.paint_port(painter, &nkey, port, origin);
@@ -2150,6 +2545,10 @@ impl DiagramCanvas {
             .port_drag
             .as_ref()
             .is_some_and(|d| d.node_key == node_key && d.port_name == port.name)
+            || self
+                .selected_port
+                .as_ref()
+                .is_some_and(|(nk, pn)| nk == node_key && pn == &port.name)
             || self
                 .wire_armed_port
                 .as_ref()
@@ -2191,7 +2590,7 @@ impl DiagramCanvas {
         );
     }
 
-    fn edge_style(kind: RelationshipKind, selected: bool) -> (Color32, f32, bool, bool) {
+    fn edge_style(kind: RelationshipKind, selected: bool) -> (Color32, f32, bool, ArrowStyle) {
         let base_color = match kind {
             RelationshipKind::Interface => Color32::from_rgb(100, 210, 175),
             RelationshipKind::Connection => Color32::from_rgb(135, 175, 240),
@@ -2212,25 +2611,40 @@ impl DiagramCanvas {
             base_color
         };
         let stroke_w = if selected { 2.6 } else { 1.6 };
+        // OMG SysML v2.0 Tables 4 & 11-15:
+        // - Connection / Interface / Binding: solid line, no arrowhead (ends match by dot/name)
+        // - Flow: solid line with filled triangle arrowhead
+        // - Allocate: solid line with open V arrowhead + «allocate»
+        // - Transition: solid line with open V arrowhead
+        // - Succession: dashed line with open V arrowhead
+        // - Dependency / Satisfy / Verify: dashed line with open V arrowhead
+        // - Specialization: solid line with hollow triangle arrowhead
+        // - Composition: solid line with filled diamond at owner end
         let is_dashed = matches!(
             kind,
-            RelationshipKind::Satisfy
-                | RelationshipKind::Verify
-                | RelationshipKind::Allocate
-                | RelationshipKind::Dependency
-        );
-        let has_arrow = matches!(
-            kind,
             RelationshipKind::Succession
-                | RelationshipKind::Transition
-                | RelationshipKind::Flow
                 | RelationshipKind::Satisfy
                 | RelationshipKind::Verify
-                | RelationshipKind::Allocate
                 | RelationshipKind::Dependency
-                | RelationshipKind::Specialization
         );
-        (color, stroke_w, is_dashed, has_arrow)
+        let arrow = match kind {
+            RelationshipKind::Connection | RelationshipKind::Interface | RelationshipKind::Binding => {
+                ArrowStyle::None
+            }
+            RelationshipKind::Flow => ArrowStyle::FilledTriangle,
+            RelationshipKind::Specialization => ArrowStyle::HollowTriangle,
+            RelationshipKind::Composition => ArrowStyle::FilledDiamondStart,
+            RelationshipKind::Allocate
+            | RelationshipKind::Transition
+            | RelationshipKind::Succession
+            | RelationshipKind::Dependency
+            | RelationshipKind::Satisfy
+            | RelationshipKind::Verify
+            | RelationshipKind::Subsetting
+            | RelationshipKind::Redefinition
+            | RelationshipKind::ReferenceSubsetting => ArrowStyle::OpenV,
+        };
+        (color, stroke_w, is_dashed, arrow)
     }
 
     fn paint_edge_geometry(
@@ -2243,7 +2657,7 @@ impl DiagramCanvas {
         if edge.waypoints.len() < 2 {
             return;
         }
-        let (color, stroke_w, is_dashed, has_arrow) = Self::edge_style(edge.kind, selected);
+        let (color, stroke_w, is_dashed, arrow_style) = Self::edge_style(edge.kind, selected);
         let pts: Vec<Pos2> = edge
             .waypoints
             .iter()
@@ -2257,9 +2671,27 @@ impl DiagramCanvas {
                 painter.line_segment([seg[0], seg[1]], Stroke::new(stroke_w, color));
             }
         }
-        if has_arrow {
-            let n = pts.len();
-            paint_arrowhead(painter, pts[n - 2], pts[n - 1], color);
+        let n = pts.len();
+        match arrow_style {
+            ArrowStyle::None => {}
+            ArrowStyle::OpenV => {
+                paint_open_v_arrowhead(painter, pts[n - 2], pts[n - 1], Stroke::new(stroke_w, color));
+            }
+            ArrowStyle::FilledTriangle => {
+                paint_arrowhead(painter, pts[n - 2], pts[n - 1], color);
+            }
+            ArrowStyle::HollowTriangle => {
+                paint_hollow_arrowhead(
+                    painter,
+                    pts[n - 2],
+                    pts[n - 1],
+                    color,
+                    Color32::from_rgb(20, 24, 30),
+                );
+            }
+            ArrowStyle::FilledDiamondStart => {
+                paint_filled_diamond(painter, pts[1], pts[0], color);
+            }
         }
     }
 
@@ -2413,6 +2845,42 @@ fn paint_dashed_line(painter: &egui::Painter, a: Pos2, b: Pos2, stroke: Stroke) 
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArrowStyle {
+    None,
+    OpenV,
+    FilledTriangle,
+    HollowTriangle,
+    FilledDiamondStart,
+}
+
+fn paint_open_v_arrowhead(painter: &egui::Painter, from: Pos2, tip: Pos2, stroke: Stroke) {
+    let dir = (tip - from).normalized();
+    if dir.length_sq() < 0.1 {
+        return;
+    }
+    let perp = Vec2::new(-dir.y, dir.x);
+    let p1 = tip - dir * 9.5 + perp * 4.5;
+    let p2 = tip - dir * 9.5 - perp * 4.5;
+    painter.line_segment([tip, p1], stroke);
+    painter.line_segment([tip, p2], stroke);
+}
+
+fn paint_filled_diamond(painter: &egui::Painter, from: Pos2, tip: Pos2, color: Color32) {
+    let dir = (tip - from).normalized();
+    if dir.length_sq() < 0.1 {
+        return;
+    }
+    let perp = Vec2::new(-dir.y, dir.x);
+    let mid = tip - dir * 5.5;
+    let tail = tip - dir * 11.0;
+    painter.add(egui::Shape::convex_polygon(
+        vec![tip, mid + perp * 4.0, tail, mid - perp * 4.0],
+        color,
+        Stroke::NONE,
+    ));
+}
+
 fn paint_arrowhead(painter: &egui::Painter, from: Pos2, tip: Pos2, color: Color32) {
     let dir = (tip - from).normalized();
     if dir.length_sq() < 0.1 {
@@ -2428,6 +2896,27 @@ fn paint_arrowhead(painter: &egui::Painter, from: Pos2, tip: Pos2, color: Color3
     ));
 }
 
+fn paint_hollow_arrowhead(
+    painter: &egui::Painter,
+    from: Pos2,
+    tip: Pos2,
+    stroke_color: Color32,
+    fill_color: Color32,
+) {
+    let dir = (tip - from).normalized();
+    if dir.length_sq() < 0.1 {
+        return;
+    }
+    let perp = Vec2::new(-dir.y, dir.x);
+    let p1 = tip - dir * 11.0 + perp * 5.5;
+    let p2 = tip - dir * 11.0 - perp * 5.5;
+    painter.add(egui::Shape::convex_polygon(
+        vec![tip, p1, p2],
+        fill_color,
+        Stroke::new(1.6, stroke_color),
+    ));
+}
+
 fn point_segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     let ab = b - a;
     let len_sq = ab.length_sq();
@@ -2437,4 +2926,745 @@ fn point_segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     let t = ((p - a).dot(ab) / len_sq).clamp(0.0, 1.0);
     let proj = a + ab * t;
     p.distance(proj)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::SYSML_V2_CATALOG;
+    use syssur_layout::Point2;
+
+    fn test_layout() -> (LayoutOutput, BTreeMap<String, NodeMeta>) {
+        let id_a = ElementId::new("Pkg::BlockA");
+        let id_b = ElementId::new("Pkg::BlockB");
+        let path_a = InstancePath::root(id_a.clone());
+        let path_b = InstancePath::root(id_b.clone());
+
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            path_a.canonical_key(),
+            PositionedNode {
+                path: path_a.clone(),
+                label: "BlockA".into(),
+                shape: NodeShape::PartBlock,
+                rect: Rect2 {
+                    x: 100.0,
+                    y: 100.0,
+                    w: 180.0,
+                    h: 80.0,
+                },
+                ports: vec![],
+            },
+        );
+        nodes.insert(
+            path_b.canonical_key(),
+            PositionedNode {
+                path: path_b.clone(),
+                label: "BlockB".into(),
+                shape: NodeShape::PartBlock,
+                rect: Rect2 {
+                    x: 420.0,
+                    y: 100.0,
+                    w: 180.0,
+                    h: 80.0,
+                },
+                ports: vec![],
+            },
+        );
+
+        let mut meta = BTreeMap::new();
+        for (p, td) in [(&path_a, id_a), (&path_b, id_b)] {
+            meta.insert(
+                p.canonical_key(),
+                NodeMeta {
+                    is_def: true,
+                    type_name: None,
+                    type_def: Some(td),
+                    specializes: None,
+                    multiplicity: None,
+                    source_file: "test.sysml".into(),
+                    origin: FeatureOrigin::Owned,
+                    attributes: vec![],
+                    short_id: None,
+                    doc: None,
+                    stereotype: "«part def»".into(),
+                },
+            );
+        }
+
+        let layout = LayoutOutput {
+            nodes,
+            edges: vec![],
+            bounds: Rect2 {
+                x: 0.0,
+                y: 0.0,
+                w: 800.0,
+                h: 600.0,
+            },
+        };
+        (layout, meta)
+    }
+
+    fn run_canvas_step(
+        ctx: &egui::Context,
+        canvas: &mut DiagramCanvas,
+        layout: &LayoutOutput,
+        meta: &BTreeMap<String, NodeMeta>,
+        active_tool: &mut Option<&'static SysmlCatalogItem>,
+        events: Vec<egui::Event>,
+    ) -> (Option<CanvasAction>, Rect) {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0)));
+        raw.events = events;
+        let mut action = None;
+        let mut avail_rect = Rect::NOTHING;
+        let mut palette_search = String::new();
+        let mut out = ctx.run_ui(raw, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                avail_rect = ui.available_rect_before_wrap();
+                action = canvas.show(
+                    ui,
+                    layout,
+                    meta,
+                    &["Pkg".to_string()],
+                    ViewKind::General,
+                    LayoutDirection::TopToBottom,
+                    false,
+                    &mut palette_search,
+                    active_tool,
+                    "test.sysml",
+                    Locale::En,
+                );
+            });
+        });
+        out.textures_delta.clear();
+        (action, avail_rect)
+    }
+
+    #[test]
+    fn click_with_small_jitter_selects_node_without_moving() {
+        let ctx = egui::Context::default();
+        let (layout, meta) = test_layout();
+        let mut canvas = DiagramCanvas::default();
+        canvas.pan = Vec2::ZERO;
+        canvas.zoom = 1.0;
+        canvas.rebuild_spatial_index(&layout);
+        let mut tool = None;
+
+        // Warm-up frame so the canvas rect and spatial state exist.
+        let (_, rect) = run_canvas_step(&ctx, &mut canvas, &layout, &meta, &mut tool, vec![]);
+        let center = rect.min + Vec2::new(190.0, 140.0);
+
+        let mut actions = Vec::new();
+        for evs in [
+            vec![
+                egui::Event::PointerMoved(center),
+                egui::Event::PointerButton {
+                    pos: center,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            vec![egui::Event::PointerMoved(center + Vec2::new(2.0, 1.0))],
+            vec![egui::Event::PointerButton {
+                pos: center + Vec2::new(2.0, 1.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        ] {
+            let (act, _) = run_canvas_step(&ctx, &mut canvas, &layout, &meta, &mut tool, evs);
+            if let Some(a) = act {
+                actions.push(a);
+            }
+        }
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, CanvasAction::MoveNodes { .. })),
+            "2px click jitter must not emit MoveNodes, got: {actions:?}"
+        );
+        assert_eq!(
+            canvas.selected.as_ref().map(InstancePath::canonical_key),
+            Some("Pkg::BlockA".to_string())
+        );
+    }
+
+    #[test]
+    fn drag_past_threshold_moves_node() {
+        let ctx = egui::Context::default();
+        let (layout, meta) = test_layout();
+        let mut canvas = DiagramCanvas::default();
+        canvas.pan = Vec2::ZERO;
+        canvas.zoom = 1.0;
+        canvas.rebuild_spatial_index(&layout);
+        let mut tool = None;
+
+        let (_, rect) = run_canvas_step(&ctx, &mut canvas, &layout, &meta, &mut tool, vec![]);
+        let start = rect.min + Vec2::new(190.0, 140.0);
+        let end = start + Vec2::new(50.0, 30.0);
+
+        let mut total_dx = 0.0_f32;
+        let mut total_dy = 0.0_f32;
+        for evs in [
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            vec![egui::Event::PointerMoved(end)],
+            vec![egui::Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        ] {
+            let (act, _) = run_canvas_step(&ctx, &mut canvas, &layout, &meta, &mut tool, evs);
+            if let Some(CanvasAction::MoveNodes { deltas }) = act {
+                for (_, dx, dy) in deltas {
+                    total_dx += dx;
+                    total_dy += dy;
+                }
+            }
+        }
+
+        assert!(
+            total_dx > 40.0 && total_dy > 20.0,
+            "expected positive MoveNodes delta across drag threshold, got ({total_dx}, {total_dy})"
+        );
+    }
+
+    #[test]
+    fn right_click_jitter_does_not_drag_or_pan_and_records_world_pos() {
+        let ctx = egui::Context::default();
+        let (layout, meta) = test_layout();
+        let mut canvas = DiagramCanvas::default();
+        canvas.pan = Vec2::new(25.0, 30.0);
+        canvas.zoom = 1.0;
+        canvas.rebuild_spatial_index(&layout);
+        let mut tool = None;
+
+        let (_, rect) = run_canvas_step(&ctx, &mut canvas, &layout, &meta, &mut tool, vec![]);
+        let target = rect.min + Vec2::new(200.0, 160.0);
+        let expected_world = canvas.screen_to_world(target + Vec2::new(3.0, 2.0), rect.min);
+
+        let mut moved = false;
+        for evs in [
+            vec![
+                egui::Event::PointerMoved(target),
+                egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Secondary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            vec![
+                egui::Event::PointerMoved(target + Vec2::new(3.0, 2.0)),
+                egui::Event::PointerButton {
+                    pos: target + Vec2::new(3.0, 2.0),
+                    button: egui::PointerButton::Secondary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        ] {
+            let (act, _) = run_canvas_step(&ctx, &mut canvas, &layout, &meta, &mut tool, evs);
+            if matches!(act, Some(CanvasAction::MoveNodes { .. })) {
+                moved = true;
+            }
+        }
+
+        assert!(!moved, "right-click jitter must never move nodes");
+        assert_eq!(canvas.pan, Vec2::new(25.0, 30.0));
+        let recorded = canvas
+            .context_world_pos
+            .expect("right-click should record context_world_pos");
+        assert!(
+            (recorded.x - expected_world.x).abs() < 1.0
+                && (recorded.y - expected_world.y).abs() < 1.0,
+            "expected world {expected_world:?}, got {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn active_palette_tool_click_places_at_cursor_world_pos() {
+        let ctx = egui::Context::default();
+        let (layout, meta) = test_layout();
+        let mut canvas = DiagramCanvas::default();
+        canvas.pan = Vec2::new(40.0, 20.0);
+        canvas.zoom = 1.25;
+        canvas.rebuild_spatial_index(&layout);
+        let part_def = SYSML_V2_CATALOG
+            .iter()
+            .find(|i| i.id == "part_def")
+            .expect("part_def item");
+        let mut tool = Some(part_def);
+
+        let (_, rect) = run_canvas_step(&ctx, &mut canvas, &layout, &meta, &mut tool, vec![]);
+        let click_pt = rect.min + Vec2::new(500.0, 400.0);
+        let expected_world = canvas.screen_to_world(click_pt, rect.min);
+
+        let _ = run_canvas_step(
+            &ctx,
+            &mut canvas,
+            &layout,
+            &meta,
+            &mut tool,
+            vec![
+                egui::Event::PointerMoved(click_pt),
+                egui::Event::PointerButton {
+                    pos: click_pt,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let (act, _) = run_canvas_step(
+            &ctx,
+            &mut canvas,
+            &layout,
+            &meta,
+            &mut tool,
+            vec![egui::Event::PointerButton {
+                pos: click_pt,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+
+        match act {
+            Some(CanvasAction::PlaceCatalogItem {
+                item,
+                world_pos: Some(Point2 { x, y }),
+                ..
+            }) => {
+                assert_eq!(item.id, "part_def");
+                assert!(
+                    (x - expected_world.x).abs() < 0.5 && (y - expected_world.y).abs() < 0.5,
+                    "expected world {expected_world:?}, got ({x}, {y})"
+                );
+            }
+            other => panic!("expected PlaceCatalogItem at cursor, got {other:?}"),
+        }
+        assert!(tool.is_none(), "active tool should disarm after click place");
+    }
+
+    #[test]
+    fn scroll_zoom_keeps_world_point_under_cursor_anchored() {
+        let ctx = egui::Context::default();
+        let (layout, meta) = test_layout();
+        let mut canvas = DiagramCanvas::default();
+        canvas.pan = Vec2::new(60.0, 60.0);
+        canvas.zoom = 1.0;
+        canvas.rebuild_spatial_index(&layout);
+        let mut tool = None;
+
+        let (_, rect) = run_canvas_step(&ctx, &mut canvas, &layout, &meta, &mut tool, vec![]);
+        let cursor = rect.min + Vec2::new(420.0, 310.0);
+        let _ = run_canvas_step(
+            &ctx,
+            &mut canvas,
+            &layout,
+            &meta,
+            &mut tool,
+            vec![egui::Event::PointerMoved(cursor)],
+        );
+        let world_before = canvas.screen_to_world(cursor, rect.min);
+
+        let _ = run_canvas_step(
+            &ctx,
+            &mut canvas,
+            &layout,
+            &meta,
+            &mut tool,
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: Vec2::new(0.0, 120.0),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let world_after = canvas.screen_to_world(cursor, rect.min);
+
+        assert!(
+            canvas.zoom > 1.0,
+            "expected scroll wheel up to increase zoom, got {}",
+            canvas.zoom
+        );
+        assert!(
+            (world_before.x - world_after.x).abs() < 0.5
+                && (world_before.y - world_after.y).abs() < 0.5,
+            "expected cursor-anchored world point {world_before:?}, got {world_after:?}"
+        );
+    }
+
+    #[test]
+    fn palette_item_click_arms_active_tool() {
+        let ctx = egui::Context::default();
+        let mut search = "Part Definition".to_string();
+        let mut active_tool = None;
+        let mut click_center = Pos2::ZERO;
+
+        fn find_palette_text(shape: &egui::epaint::Shape) -> Option<Pos2> {
+            match shape {
+                egui::epaint::Shape::Text(t)
+                    if t.galley.text() == "Part Definition" && t.pos.y > 60.0 =>
+                {
+                    Some(t.pos + Vec2::new(30.0, 6.0))
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().find_map(find_palette_text),
+                _ => None,
+            }
+        }
+
+        let run_palette = |ctx: &egui::Context,
+                           search: &mut String,
+                           active_tool: &mut Option<&'static SysmlCatalogItem>,
+                           events: Vec<egui::Event>|
+         -> Pos2 {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0)));
+            raw.events = events;
+            let mut center = Pos2::ZERO;
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::Panel::left("pal_test").show(ui, |ui| {
+                    show_optional_palette(ui, search, active_tool);
+                });
+            });
+            out.textures_delta.clear();
+            for prim in &out.shapes {
+                if let Some(p) = find_palette_text(&prim.shape) {
+                    center = p;
+                }
+            }
+            center
+        };
+
+        // Frame 1: find Part Definition label center
+        let c = run_palette(&ctx, &mut search, &mut active_tool, vec![]);
+        if c != Pos2::ZERO {
+            click_center = c;
+        }
+        assert_ne!(click_center, Pos2::ZERO, "Part Definition item must render");
+
+        let _ = run_palette(
+            &ctx,
+            &mut search,
+            &mut active_tool,
+            vec![
+                egui::Event::PointerMoved(click_center),
+                egui::Event::PointerButton {
+                    pos: click_center,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let _ = run_palette(
+            &ctx,
+            &mut search,
+            &mut active_tool,
+            vec![egui::Event::PointerButton {
+                pos: click_center,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+
+        assert_eq!(
+            active_tool.map(|i| i.id),
+            Some("part_def"),
+            "clicking palette item must arm active tool even when draggable"
+        );
+    }
+
+    #[test]
+    fn dragging_corner_handle_resizes_selected_block() {
+        let ctx = egui::Context::default();
+        let (layout, meta) = test_layout();
+        let mut canvas = DiagramCanvas::default();
+        canvas.pan = Vec2::ZERO;
+        canvas.zoom = 1.0;
+        canvas.selected = Some(InstancePath::root(ElementId::new("Pkg::BlockA")));
+        canvas.rebuild_spatial_index(&layout);
+        let mut tool = None;
+
+        let (_, rect) = run_canvas_step(&ctx, &mut canvas, &layout, &meta, &mut tool, vec![]);
+        // BlockA rect is (100, 100, 180, 80) -> bottom-right corner at (280, 180)
+        let corner_start = rect.min + Vec2::new(280.0, 180.0);
+        let drag_end = corner_start + Vec2::new(60.0, 40.0);
+
+        let mut resize_action = None;
+        for evs in [
+            vec![
+                egui::Event::PointerMoved(corner_start),
+                egui::Event::PointerButton {
+                    pos: corner_start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            vec![egui::Event::PointerMoved(drag_end)],
+        ] {
+            let (act, _) = run_canvas_step(&ctx, &mut canvas, &layout, &meta, &mut tool, evs);
+            if matches!(act, Some(CanvasAction::ResizeNode { .. })) {
+                resize_action = act;
+            }
+        }
+
+        match resize_action {
+            Some(CanvasAction::ResizeNode {
+                node_key,
+                width,
+                height,
+                anchor_x,
+                anchor_y,
+                anchor_right,
+                anchor_bottom,
+            }) => {
+                assert_eq!(node_key, "Pkg::BlockA");
+                assert!((width - 240.0).abs() < 1.0, "expected width ~240, got {width}");
+                assert!((height - 120.0).abs() < 1.0, "expected height ~120, got {height}");
+                assert!((anchor_x - 100.0).abs() < 0.5 && (anchor_y - 100.0).abs() < 0.5);
+                assert!(!anchor_right && !anchor_bottom);
+            }
+            other => panic!("expected ResizeNode action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clicking_port_selects_port_instead_of_parent_node() {
+        let ctx = egui::Context::default();
+        let (mut layout, meta) = test_layout();
+        let node_a = layout
+            .nodes
+            .get_mut("Pkg::BlockA")
+            .expect("BlockA test node");
+        node_a.ports.push(PositionedPort {
+            name: "pwrOut".into(),
+            direction: PortDirection::Out,
+            is_conjugated: false,
+            type_label: Some("PowerPort".into()),
+            side: PortSide::Right,
+            offset: 0.5,
+            anchor: Point2 { x: 280.0, y: 140.0 },
+            normal: Point2 { x: 1.0, y: 0.0 },
+        });
+        let mut canvas = DiagramCanvas::default();
+        canvas.pan = Vec2::ZERO;
+        canvas.zoom = 1.0;
+        canvas.rebuild_spatial_index(&layout);
+        let mut tool = None;
+
+        let (_, rect) = run_canvas_step(&ctx, &mut canvas, &layout, &meta, &mut tool, vec![]);
+        let port_pt = rect.min + Vec2::new(280.0, 140.0);
+
+        let _ = run_canvas_step(
+            &ctx,
+            &mut canvas,
+            &layout,
+            &meta,
+            &mut tool,
+            vec![
+                egui::Event::PointerMoved(port_pt),
+                egui::Event::PointerButton {
+                    pos: port_pt,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let (act, _) = run_canvas_step(
+            &ctx,
+            &mut canvas,
+            &layout,
+            &meta,
+            &mut tool,
+            vec![egui::Event::PointerButton {
+                pos: port_pt,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+
+        match act {
+            Some(CanvasAction::SelectPort {
+                node_path,
+                port_name,
+                ..
+            }) => {
+                assert_eq!(node_path.canonical_key(), "Pkg::BlockA");
+                assert_eq!(port_name, "pwrOut");
+            }
+            other => panic!("expected SelectPort action, got {other:?}"),
+        }
+        assert_eq!(
+            canvas.selected_port,
+            Some(("Pkg::BlockA".to_string(), "pwrOut".to_string()))
+        );
+        assert!(canvas.selected.is_none());
+    }
+
+    #[test]
+    fn clicking_connector_inside_compound_container_selects_edge() {
+        let ctx = egui::Context::default();
+        let parent_id = ElementId::new("Pkg::System");
+        let child_a = ElementId::new("Pkg::System::a");
+        let child_b = ElementId::new("Pkg::System::b");
+        let path_parent = InstancePath::root(parent_id.clone());
+        let path_a = path_parent.push(child_a.clone());
+        let path_b = path_parent.push(child_b.clone());
+
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            path_parent.canonical_key(),
+            PositionedNode {
+                path: path_parent.clone(),
+                label: "System".into(),
+                shape: NodeShape::PartBlock,
+                rect: Rect2 {
+                    x: 40.0,
+                    y: 40.0,
+                    w: 500.0,
+                    h: 240.0,
+                },
+                ports: vec![],
+            },
+        );
+        nodes.insert(
+            path_a.canonical_key(),
+            PositionedNode {
+                path: path_a.clone(),
+                label: "a".into(),
+                shape: NodeShape::PartBlock,
+                rect: Rect2 {
+                    x: 70.0,
+                    y: 110.0,
+                    w: 140.0,
+                    h: 80.0,
+                },
+                ports: vec![],
+            },
+        );
+        nodes.insert(
+            path_b.canonical_key(),
+            PositionedNode {
+                path: path_b.clone(),
+                label: "b".into(),
+                shape: NodeShape::PartBlock,
+                rect: Rect2 {
+                    x: 360.0,
+                    y: 110.0,
+                    w: 140.0,
+                    h: 80.0,
+                },
+                ports: vec![],
+            },
+        );
+
+        let mut meta = BTreeMap::new();
+        for (p, td, is_def) in [
+            (&path_parent, parent_id, true),
+            (&path_a, child_a, false),
+            (&path_b, child_b, false),
+        ] {
+            meta.insert(
+                p.canonical_key(),
+                NodeMeta {
+                    is_def,
+                    type_name: None,
+                    type_def: Some(td),
+                    specializes: None,
+                    multiplicity: None,
+                    source_file: "test.sysml".into(),
+                    origin: FeatureOrigin::Owned,
+                    attributes: vec![],
+                    short_id: None,
+                    doc: None,
+                    stereotype: if is_def { "«part def»" } else { "«part»" }.into(),
+                },
+            );
+        }
+
+        let layout = LayoutOutput {
+            nodes,
+            edges: vec![RoutedEdge {
+                id: "Pkg::System::link#0".into(),
+                kind: RelationshipKind::Connection,
+                label: Some("link : PowerInterface".into()),
+                guard: None,
+                waypoints: vec![
+                    Point2 { x: 210.0, y: 150.0 },
+                    Point2 { x: 360.0, y: 150.0 },
+                ],
+            }],
+            bounds: Rect2 {
+                x: 0.0,
+                y: 0.0,
+                w: 600.0,
+                h: 340.0,
+            },
+        };
+
+        let mut canvas = DiagramCanvas::default();
+        canvas.pan = Vec2::ZERO;
+        canvas.zoom = 1.0;
+        canvas.rebuild_spatial_index(&layout);
+        let mut tool = None;
+
+        let (_, rect) = run_canvas_step(&ctx, &mut canvas, &layout, &meta, &mut tool, vec![]);
+        let edge_pt = rect.min + Vec2::new(285.0, 150.0);
+
+        let _ = run_canvas_step(
+            &ctx,
+            &mut canvas,
+            &layout,
+            &meta,
+            &mut tool,
+            vec![
+                egui::Event::PointerMoved(edge_pt),
+                egui::Event::PointerButton {
+                    pos: edge_pt,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let (act, _) = run_canvas_step(
+            &ctx,
+            &mut canvas,
+            &layout,
+            &meta,
+            &mut tool,
+            vec![egui::Event::PointerButton {
+                pos: edge_pt,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+
+        assert!(
+            matches!(act, Some(CanvasAction::SelectEdge { index: 0 })),
+            "expected SelectEdge {{ index: 0 }} inside compound container, got {act:?}"
+        );
+        assert_eq!(canvas.selected_edge, Some(0));
+    }
 }

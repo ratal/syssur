@@ -529,7 +529,7 @@ pub fn plan_text_edit(cmd: &SyssurCommand, current_text: &str) -> Result<TextEdi
                 .map(|s| format!(" :> {}", format_sysml_name(s)))
                 .unwrap_or_default();
             let stmt = format!("    part def {fname}{spec} {{\n    }}\n");
-            plan_insert_into_container(&file, current_text, &["package"], package, &stmt)
+            plan_insert_into_container(&file, current_text, &["package", "part def", "part"], package, &stmt)
         }
         SyssurCommand::CreatePartUsage {
             owner_def,

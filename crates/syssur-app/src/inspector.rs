@@ -28,11 +28,26 @@ pub enum SelectedTarget {
         path: InstancePath,
         element_id: ElementId,
     },
+    Port {
+        node_key: String,
+        owner_label: String,
+        port_name: String,
+        port_type: Option<String>,
+        direction: PortDirection,
+        is_conjugated: bool,
+        side: Option<PortSide>,
+        file: String,
+    },
     Element(ElementId),
     Edge {
+        name: Option<String>,
         source: String,
         target: String,
+        source_port: Option<String>,
+        target_port: Option<String>,
         kind: RelationshipKind,
+        type_name: Option<String>,
+        owner_scope: Option<String>,
         trigger: Option<String>,
         guard: Option<String>,
         effect: Option<String>,
@@ -60,6 +75,7 @@ pub struct InspectorDraft {
     pub trigger: String,
     pub guard: String,
     pub effect: String,
+    pub diag_panel_height: f32,
 }
 
 impl InspectorDraft {
@@ -138,7 +154,89 @@ pub fn show_inspector_panel(
 
     match tab {
         InspectorTab::Details => show_details_tab(ui, selected, draft, graph, active_layout, locale),
-        InspectorTab::Code => show_code_tab(ui, graph, collab, active_file, locale),
+        InspectorTab::Code => show_code_tab(ui, draft, graph, collab, active_file, locale),
+    }
+}
+
+pub fn relationship_kind_info(
+    kind: RelationshipKind,
+) -> (&'static str, &'static str, &'static str) {
+    match kind {
+        RelationshipKind::Connection => (
+            "Connection",
+            "connect",
+            "Structural link binding two compatible parts or ports",
+        ),
+        RelationshipKind::Interface => (
+            "Interface",
+            "interface",
+            "Typed port-to-port interaction defined by an interface def",
+        ),
+        RelationshipKind::Flow => (
+            "Item Flow",
+            "flow",
+            "Transfer of items, energy, or signals between ports/features",
+        ),
+        RelationshipKind::Binding => (
+            "Binding Connector",
+            "bind",
+            "Asserts value or feature equality between two endpoints",
+        ),
+        RelationshipKind::Allocate => (
+            "Allocation",
+            "allocate",
+            "Maps a logical or behavioral element onto a physical structure",
+        ),
+        RelationshipKind::Dependency => (
+            "Dependency",
+            "dependency",
+            "Client element depends on supplier specification or contract",
+        ),
+        RelationshipKind::Specialization => (
+            "Specialization",
+            ":>",
+            "Subclass/subdefinition inheritance of features and constraints",
+        ),
+        RelationshipKind::Subsetting => (
+            "Subsetting",
+            ":>",
+            "Usage specializes and narrows a broader typed feature",
+        ),
+        RelationshipKind::Redefinition => (
+            "Redefinition",
+            ":>>",
+            "Overrides an inherited feature's name, type, or value",
+        ),
+        RelationshipKind::ReferenceSubsetting => (
+            "Reference Subsetting",
+            "::>",
+            "References another feature without owning a distinct part",
+        ),
+        RelationshipKind::Composition => (
+            "Composition",
+            "part",
+            "Whole-part structural ownership containment relationship",
+        ),
+        RelationshipKind::Succession => (
+            "Control Succession",
+            "then / first ... then",
+            "Temporal ordering between action nodes in an ActionFlow",
+        ),
+        RelationshipKind::Transition => (
+            "State Transition",
+            "transition",
+            "Event-triggered behavioral transition with optional guard/effect",
+        ),
+        RelationshipKind::Satisfy => (
+            "Satisfy Requirement",
+            "satisfy",
+            "Declares that a design element fulfills a stated requirement",
+        ),
+        RelationshipKind::Verify => (
+            "Verify Requirement",
+            "verify",
+            "Declares that a verification case tests requirement compliance",
+        ),
     }
 }
 
@@ -158,17 +256,22 @@ fn show_details_tab(
             ui.label(RichText::new(tr(locale, TextKey::DetailsSelectHint)).weak());
         }
         SelectedTarget::Edge {
+            name,
             source,
             target,
+            source_port,
+            target_port,
             kind,
+            type_name,
+            owner_scope,
             trigger,
             guard,
             effect,
             file,
         } => {
             let key = format!(
-                "edge:{source}->{target}:{kind:?}:{:?}:{:?}:{:?}",
-                trigger, guard, effect
+                "edge:{:?}:{source}->{target}:{kind:?}:{:?}:{:?}:{:?}:{:?}",
+                name, type_name, trigger, guard, effect
             );
             if draft.synced_key != key {
                 draft.synced_key = key;
@@ -177,11 +280,62 @@ fn show_details_tab(
                 draft.effect = effect.clone().unwrap_or_default();
             }
 
-            ui.label(RichText::new(format!("Relationship: {kind:?}")).strong());
+            let (disp_name, sysml_kw, summary) = relationship_kind_info(*kind);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(disp_name).strong());
+                ui.label(
+                    RichText::new(format!("[{sysml_kw}]"))
+                        .color(Color32::from_rgb(125, 200, 250))
+                        .monospace()
+                        .small(),
+                );
+            });
+            ui.label(RichText::new(summary).small().weak());
             ui.separator();
-            ui.label(format!("From: {source}"));
-            ui.label(format!("To:   {target}"));
-            ui.label(format!("{}: {file}", tr(locale, TextKey::FieldSourceFile)));
+
+            egui::Grid::new("edge_details_grid")
+                .num_columns(2)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Type:").weak());
+                    ui.label(format!("{disp_name} ({sysml_kw})"));
+                    ui.end_row();
+
+                    if let Some(n) = name {
+                        ui.label(RichText::new("Name:").weak());
+                        ui.label(n);
+                        ui.end_row();
+                    }
+                    if let Some(tn) = type_name {
+                        ui.label(RichText::new("Interface / Type:").weak());
+                        ui.label(tn);
+                        ui.end_row();
+                    }
+                    if let Some(owner) = owner_scope {
+                        ui.label(RichText::new("Owner:").weak());
+                        ui.label(owner);
+                        ui.end_row();
+                    }
+                    ui.label(RichText::new("From:").weak());
+                    ui.label(source);
+                    ui.end_row();
+                    if let Some(sp) = source_port {
+                        ui.label(RichText::new("Source Port:").weak());
+                        ui.label(sp);
+                        ui.end_row();
+                    }
+                    ui.label(RichText::new("To:").weak());
+                    ui.label(target);
+                    ui.end_row();
+                    if let Some(tp) = target_port {
+                        ui.label(RichText::new("Target Port:").weak());
+                        ui.label(tp);
+                        ui.end_row();
+                    }
+                    ui.label(RichText::new(format!("{}:", tr(locale, TextKey::FieldSourceFile))).weak());
+                    ui.label(file);
+                    ui.end_row();
+                });
 
             if *kind == RelationshipKind::Succession {
                 ui.separator();
@@ -236,6 +390,168 @@ fn show_details_tab(
             if ui.button(tr(locale, TextKey::OpenInCode)).clicked() {
                 action = Some(InspectorAction::JumpToCode(file.clone()));
             }
+        }
+        SelectedTarget::Port {
+            node_key,
+            owner_label,
+            port_name,
+            port_type,
+            direction,
+            is_conjugated,
+            side,
+            file,
+        } => {
+            let live_port = active_layout
+                .and_then(|l| l.nodes.get(node_key))
+                .and_then(|n| n.ports.iter().find(|p| p.name == *port_name));
+            let eff_conj = live_port.map_or(*is_conjugated, |p| p.is_conjugated);
+            let eff_base_dir = live_port.map_or(*direction, |p| p.direction);
+            let eff_type = live_port
+                .and_then(|p| p.type_label.clone())
+                .or_else(|| port_type.clone());
+            let eff_side = live_port.map(|p| p.side).or(*side);
+            let eff_dir = eff_base_dir.effective_direction(eff_conj);
+
+            let key = format!(
+                "port:{node_key}:{port_name}:{eff_conj}:{:?}:{:?}:{:?}",
+                eff_type, eff_dir, eff_side
+            );
+            if draft.synced_key != key {
+                draft.synced_key = key;
+                draft.name = port_name.clone();
+            }
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Port Usage").strong());
+                ui.label(
+                    RichText::new(if eff_conj { "[~port]" } else { "[port]" })
+                        .color(if eff_conj {
+                            Color32::from_rgb(245, 165, 95)
+                        } else {
+                            Color32::from_rgb(110, 200, 245)
+                        })
+                        .monospace()
+                        .small(),
+                );
+            });
+            ui.separator();
+
+            egui::Grid::new("port_details_grid")
+                .num_columns(2)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Name:").weak());
+                    ui.label(port_name);
+                    ui.end_row();
+
+                    ui.label(RichText::new("Owner:").weak());
+                    ui.label(owner_label);
+                    ui.end_row();
+
+                    if let Some(ref pt) = eff_type {
+                        ui.label(RichText::new("Port Definition:").weak());
+                        ui.label(if eff_conj {
+                            format!("~{pt}")
+                        } else {
+                            pt.clone()
+                        });
+                        ui.end_row();
+                    }
+
+                    ui.label(RichText::new("Declared Dir:").weak());
+                    ui.label(format!("{eff_base_dir:?}"));
+                    ui.end_row();
+
+                    ui.label(RichText::new("Effective Dir:").weak());
+                    ui.label(format!(
+                        "{eff_dir:?}{}",
+                        if eff_conj { " (conjugated ~)" } else { "" }
+                    ));
+                    ui.end_row();
+
+                    if let Some(s) = eff_side {
+                        ui.label(RichText::new("Border Side:").weak());
+                        ui.label(format!("{s:?}"));
+                        ui.end_row();
+                    }
+
+                    ui.label(RichText::new(format!("{}:", tr(locale, TextKey::FieldSourceFile))).weak());
+                    ui.label(file);
+                    ui.end_row();
+                });
+
+            ui.separator();
+            ui.label(RichText::new(tr(locale, TextKey::FieldName)).strong());
+            ui.horizontal(|ui| {
+                ui.text_edit_singleline(&mut draft.name);
+                if ui.button(tr(locale, TextKey::Apply)).clicked()
+                    && !draft.name.trim().is_empty()
+                    && draft.name.trim() != port_name
+                {
+                    action = Some(InspectorAction::ApplyCommand(SyssurCommand::RenameElement {
+                        file: file.clone(),
+                        old_name: port_name.clone(),
+                        new_name: draft.name.trim().to_string(),
+                    }));
+                }
+            });
+
+            ui.add_space(4.0);
+            if ui.button("Toggle Conjugation (~)").clicked() {
+                action = Some(InspectorAction::ApplyCommand(
+                    SyssurCommand::TogglePortConjugation {
+                        file: file.clone(),
+                        port_name: port_name.clone(),
+                    },
+                ));
+            }
+
+            ui.add_space(4.0);
+            ui.label(RichText::new("Border Position:").weak().small());
+            ui.horizontal_wrapped(|ui| {
+                let cur_offset = live_port.map_or(0.5, |p| p.offset);
+                for (lbl, target_side) in [
+                    ("Top", Some(PortSide::Top)),
+                    ("Right", Some(PortSide::Right)),
+                    ("Bottom", Some(PortSide::Bottom)),
+                    ("Left", Some(PortSide::Left)),
+                    ("Auto", None),
+                ] {
+                    let is_cur = match target_side {
+                        Some(s) => eff_side == Some(s),
+                        None => false,
+                    };
+                    if ui.selectable_label(is_cur, lbl).clicked() {
+                        action = Some(InspectorAction::MovePort {
+                            node_key: node_key.clone(),
+                            port_name: port_name.clone(),
+                            placement: target_side.map(|side| PortPlacement {
+                                side,
+                                offset: cur_offset,
+                            }),
+                        });
+                    }
+                }
+            });
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button(tr(locale, TextKey::OpenInCode)).clicked() {
+                    action = Some(InspectorAction::JumpToCode(file.clone()));
+                }
+                if ui
+                    .button(
+                        RichText::new("Delete Port").color(Color32::from_rgb(245, 115, 115)),
+                    )
+                    .clicked()
+                {
+                    action = Some(InspectorAction::ApplyCommand(SyssurCommand::DeleteElement {
+                        file: file.clone(),
+                        kind_hint: Some("port".to_string()),
+                        name: port_name.clone(),
+                    }));
+                }
+            });
         }
         SelectedTarget::Node { path, element_id } => {
             let resolved = resolve_details(graph, active_layout, element_id, Some(path));
@@ -757,366 +1073,491 @@ fn resolve_details(
             })
         });
 
-    if let Some(req) = graph
-        .requirements
-        .get(element_id)
-        .or_else(|| graph.requirements.values().find(|r| r.name == short))
-    {
-        return Some(ResolvedDetails {
-            key: format!("req:{}:{:?}:{:?}", req.id, req.short_id, req.doc),
-            kind_label: if req.is_usage {
-                "Requirement Usage".to_string()
-            } else {
-                "Requirement Definition".to_string()
-            },
-            kind_hint: Some(if req.is_usage { "requirement" } else { "requirement def" }.into()),
-            qualified_name: req.id.as_str().to_string(),
-            short_name: req.name.clone(),
-            source_file: req.span.file.clone(),
-            origin_label: None,
-            short_id: req.short_id.clone(),
-            doc: req.doc.clone(),
-            type_name: None,
-            multiplicity: None,
-            modifiers: graph
-                .element_modifiers
-                .get(&req.id)
-                .cloned()
-                .unwrap_or(mods),
-            supports_doc: true,
-            supports_short_id: true,
-            supports_type: false,
-            supports_def_usage: true,
-            supports_modifiers: true,
-            block_editor: None,
-        });
-    }
-
-    if let Some(st) = find_state_recursive(graph, element_id) {
-        return Some(ResolvedDetails {
-            key: format!("state:{}:{:?}", st.id, st.doc),
-            kind_label: if st.is_def {
-                "State Definition".to_string()
-            } else {
-                "State Usage".to_string()
-            },
-            kind_hint: Some(if st.is_def { "state def" } else { "state" }.into()),
-            qualified_name: st.id.as_str().to_string(),
-            short_name: st.name.clone(),
-            source_file: st.span.file.clone(),
-            origin_label: None,
-            short_id: None,
-            doc: st.doc.clone(),
-            type_name: None,
-            multiplicity: None,
-            modifiers: graph.element_modifiers.get(&st.id).cloned().unwrap_or(mods),
-            supports_doc: true,
-            supports_short_id: false,
-            supports_type: false,
-            supports_def_usage: true,
-            supports_modifiers: true,
-            block_editor: None,
-        });
-    }
-
-    if let Some(act) = find_action_recursive(graph, element_id) {
-        let kind_label = match act.kind {
-            ActionNodeKind::Action => "Action",
-            ActionNodeKind::Start => "Start Node",
-            ActionNodeKind::Done => "Done Node",
-            ActionNodeKind::Fork => "Fork Node",
-            ActionNodeKind::Join => "Join Node",
-            ActionNodeKind::Decide => "Decide Node",
-            ActionNodeKind::Merge => "Merge Node",
-        };
-        return Some(ResolvedDetails {
-            key: format!("act:{}:{:?}", act.id, act.doc),
-            kind_label: kind_label.to_string(),
-            kind_hint: None,
-            qualified_name: act.id.as_str().to_string(),
-            short_name: act.name.clone(),
-            source_file: act.span.file.clone(),
-            origin_label: None,
-            short_id: None,
-            doc: act.doc.clone(),
-            type_name: None,
-            multiplicity: None,
-            modifiers: graph
-                .element_modifiers
-                .get(&act.id)
-                .cloned()
-                .unwrap_or(mods),
-            supports_doc: act.kind == ActionNodeKind::Action,
-            supports_short_id: false,
-            supports_type: false,
-            supports_def_usage: act.kind == ActionNodeKind::Action,
-            supports_modifiers: act.kind == ActionNodeKind::Action,
-            block_editor: None,
-        });
-    }
-
-    if let Some(elem) = graph
-        .generic_elements
-        .get(element_id)
-        .or_else(|| graph.generic_elements.values().find(|e| e.name == short))
-    {
-        return Some(ResolvedDetails {
-            key: format!("elem:{}:{:?}:{:?}", elem.id, elem.doc, elem.short_id),
-            kind_label: format!(
-                "{:?}{}",
-                elem.kind,
-                if elem.is_def { " Def" } else { "" }
-            ),
-            kind_hint: None,
-            qualified_name: elem.id.as_str().to_string(),
-            short_name: elem.name.clone(),
-            source_file: elem.span.file.clone(),
-            origin_label: elem
-                .type_ref
-                .as_ref()
-                .map(|t| format!(": {}", t.short_name())),
-            short_id: elem.short_id.clone(),
-            doc: elem.doc.clone(),
-            type_name: elem.type_ref.as_ref().map(|t| t.short_name().to_string()),
-            multiplicity: None,
-            modifiers: graph
-                .element_modifiers
-                .get(&elem.id)
-                .cloned()
-                .unwrap_or(mods),
-            supports_doc: true,
-            supports_short_id: true,
-            supports_type: false,
-            supports_def_usage: true,
-            supports_modifiers: true,
-            block_editor: None,
-        });
-    }
-
-    if let Some(pd) = graph.resolve_part_def(element_id) {
-        if element_id == &pd.id {
-            let eff_attrs: Vec<(AttributeUsage, bool)> = graph
-                .effective_attributes_for_def(&pd.id)
-                .into_iter()
-                .map(|a| {
-                    let inherited = matches!(a.origin, FeatureOrigin::Inherited(_));
-                    (a, inherited)
-                })
-                .collect();
-            let eff_ports: Vec<BlockPortSummary> = graph
-                .effective_ports_for_def(&pd.id)
-                .into_iter()
-                .map(|p| BlockPortSummary {
-                    name: p.name,
-                    type_name: p.port_def.as_ref().map(|d| d.short_name().to_string()),
-                    is_conjugated: p.is_conjugated,
-                    direction: p.direction,
-                })
-                .collect();
-            let specializes_str = pd
-                .specializes
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let attr_sig: Vec<String> = eff_attrs.iter().map(|(a, _)| a.display_label()).collect();
-            let port_sig: Vec<String> = eff_ports
-                .iter()
-                .map(|p| format!("{}:{}", p.name, p.is_conjugated))
-                .collect();
-            return Some(ResolvedDetails {
-                key: format!(
-                    "partdef:{}:{}:{:?}:{:?}",
-                    pd.id, specializes_str, attr_sig, port_sig
-                ),
-                kind_label: "Part Definition".to_string(),
-                kind_hint: Some("part def".into()),
-                qualified_name: pd.id.as_str().to_string(),
-                short_name: pd.name.clone(),
-                source_file: pd.span.file.clone(),
-                origin_label: if pd.specializes.is_empty() {
-                    None
-                } else {
-                    Some(format!(":> {specializes_str}"))
-                },
-                short_id: None,
-                doc: None,
-                type_name: None,
-                multiplicity: None,
-                modifiers: graph
-                    .element_modifiers
-                    .get(&pd.id)
-                    .cloned()
-                    .unwrap_or(mods),
-                supports_doc: true,
-                supports_short_id: false,
-                supports_type: false,
-                supports_def_usage: true,
-                supports_modifiers: true,
-                block_editor: Some(BlockEditContext {
-                    owner_name: pd.name.clone(),
-                    is_part_def: true,
-                    specializes: specializes_str,
-                    attributes: eff_attrs,
-                    ports: eff_ports,
-                    node_key: resolved_node_key,
-                }),
-            });
-        }
-    }
-
-    if let Some(pu) = find_part_usage(graph, element_id) {
-        let origin_label = match &pu.origin {
-            FeatureOrigin::Owned => None,
-            FeatureOrigin::Inherited(b) => Some(format!("^ Inherited from {}", b.short_name())),
-            FeatureOrigin::Subsetted(t) => Some(format!(":> Subsets {}", t.short_name())),
-            FeatureOrigin::Redefined(t) => Some(format!(":>> Redefines {}", t.short_name())),
-        };
-        let mut by_attr: BTreeMap<String, (AttributeUsage, bool)> = BTreeMap::new();
-        if let Some(ref td) = pu.type_def {
-            for attr in graph.effective_attributes_for_def(td) {
-                by_attr.insert(attr.name.clone(), (attr, true));
-            }
-        }
-        for local in &pu.attributes {
-            let mut merged = local.clone();
-            if let Some((prev, _)) = by_attr.get(&merged.name) {
-                if merged.type_name.is_none() {
-                    merged.type_name = prev.type_name.clone();
-                }
-                if merged.value_expr.is_none() {
-                    merged.value_expr = prev.value_expr.clone();
-                }
-            }
-            by_attr.insert(merged.name.clone(), (merged, false));
-        }
-        let merged_attrs: Vec<(AttributeUsage, bool)> = by_attr.into_values().collect();
-        let eff_ports_raw = if pu.ports.is_empty() {
-            pu.type_def
-                .as_ref()
-                .map(|td| graph.effective_ports_for_def(td))
-                .unwrap_or_default()
-        } else {
-            pu.ports.clone()
-        };
-        let eff_ports: Vec<BlockPortSummary> = eff_ports_raw
-            .into_iter()
-            .map(|p| BlockPortSummary {
-                name: p.name,
-                type_name: p.port_def.as_ref().map(|d| d.short_name().to_string()),
-                is_conjugated: p.is_conjugated,
-                direction: p.direction,
-            })
-            .collect();
-        let attr_sig: Vec<String> = merged_attrs
-            .iter()
-            .map(|(a, inh)| format!("{}({})", a.display_label(), inh))
-            .collect();
-        let port_sig: Vec<String> = eff_ports
-            .iter()
-            .map(|p| format!("{}:{}", p.name, p.is_conjugated))
-            .collect();
-        return Some(ResolvedDetails {
-            key: format!(
-                "part:{}:{:?}:{:?}:{:?}:{:?}",
-                pu.id,
-                pu.type_def.as_ref().map(|t| t.as_str()),
-                pu.multiplicity,
-                attr_sig,
-                port_sig
-            ),
-            kind_label: "Part Usage".to_string(),
-            kind_hint: Some("part".into()),
-            qualified_name: path
-                .map(ToString::to_string)
-                .unwrap_or_else(|| pu.id.as_str().to_string()),
-            short_name: pu.name.clone(),
-            source_file: pu.span.file.clone(),
-            origin_label,
-            short_id: None,
-            doc: None,
-            type_name: pu.type_def.as_ref().map(|t| t.short_name().to_string()),
-            multiplicity: pu.multiplicity,
-            modifiers: graph
-                .element_modifiers
-                .get(&pu.id)
-                .cloned()
-                .unwrap_or(mods),
-            supports_doc: true,
-            supports_short_id: false,
-            supports_type: true,
-            supports_def_usage: true,
-            supports_modifiers: true,
-            block_editor: Some(BlockEditContext {
-                owner_name: pu.name.clone(),
-                is_part_def: false,
-                specializes: String::new(),
-                attributes: merged_attrs,
-                ports: eff_ports,
-                node_key: resolved_node_key,
-            }),
-        });
-    }
-
+    // Pass 1: exact ElementId matches across every collection (no short-name shadowing).
     if let Some(pkg) = graph.packages.get(element_id) {
-        return Some(ResolvedDetails {
-            key: format!("pkg:{}", pkg.id),
-            kind_label: "Package".to_string(),
-            kind_hint: Some("package".into()),
-            qualified_name: pkg.id.as_str().to_string(),
-            short_name: pkg.name.clone(),
-            source_file: pkg.span.file.clone(),
-            origin_label: None,
-            short_id: None,
-            doc: None,
-            type_name: None,
-            multiplicity: None,
-            modifiers: mods,
-            supports_doc: true,
-            supports_short_id: false,
-            supports_type: false,
-            supports_def_usage: false,
-            supports_modifiers: false,
-            block_editor: None,
-        });
+        return Some(details_for_package(pkg, mods));
+    }
+    if let Some(view) = graph.views.get(element_id) {
+        return Some(details_for_view(view, mods));
+    }
+    if let Some(pd) = graph.part_defs.get(element_id) {
+        return Some(details_for_part_def(graph, pd, mods, resolved_node_key));
+    }
+    if let Some(pdef) = graph.port_defs.get(element_id) {
+        return Some(details_for_port_def(pdef, mods));
+    }
+    if let Some(req) = graph.requirements.get(element_id) {
+        return Some(details_for_requirement(req, graph, mods));
+    }
+    if let Some(st) = find_state_recursive(graph, element_id, true) {
+        return Some(details_for_state(st, graph, mods));
+    }
+    if let Some(act) = find_action_recursive(graph, element_id, true) {
+        return Some(details_for_action(act, graph, mods));
+    }
+    if let Some(elem) = graph.generic_elements.get(element_id) {
+        return Some(details_for_generic(elem, graph, mods));
+    }
+    if let Some(pu) = find_part_usage(graph, element_id, true) {
+        return Some(details_for_part_usage(
+            graph,
+            pu,
+            path,
+            mods,
+            resolved_node_key,
+        ));
     }
 
-    if let Some(view) = graph.views.get(element_id) {
-        return Some(ResolvedDetails {
-            key: format!("view:{}", view.id),
-            kind_label: format!("{:?} View", view.kind),
-            kind_hint: Some(if view.is_usage { "view" } else { "view def" }.into()),
-            qualified_name: view.id.as_str().to_string(),
-            short_name: view.name.clone(),
-            source_file: view.span.file.clone(),
-            origin_label: None,
-            short_id: None,
-            doc: None,
-            type_name: None,
-            multiplicity: None,
-            modifiers: mods,
-            supports_doc: false,
-            supports_short_id: false,
-            supports_type: false,
-            supports_def_usage: true,
-            supports_modifiers: false,
-            block_editor: None,
-        });
+    // Pass 2: short-name fallback resolution when an unqualified ElementId was supplied.
+    if let Some(pd) = graph.resolve_part_def(element_id) {
+        return Some(details_for_part_def(graph, pd, mods, resolved_node_key));
+    }
+    if let Some(pu) = find_part_usage(graph, element_id, false) {
+        return Some(details_for_part_usage(
+            graph,
+            pu,
+            path,
+            mods,
+            resolved_node_key,
+        ));
+    }
+    if let Some(pdef) = graph.port_defs.values().find(|p| p.name == short) {
+        return Some(details_for_port_def(pdef, mods));
+    }
+    if let Some(req) = graph.requirements.values().find(|r| r.name == short) {
+        return Some(details_for_requirement(req, graph, mods));
+    }
+    if let Some(st) = find_state_recursive(graph, element_id, false) {
+        return Some(details_for_state(st, graph, mods));
+    }
+    if let Some(act) = find_action_recursive(graph, element_id, false) {
+        return Some(details_for_action(act, graph, mods));
+    }
+    if let Some(elem) = graph.generic_elements.values().find(|e| e.name == short) {
+        return Some(details_for_generic(elem, graph, mods));
+    }
+    if let Some(pkg) = graph.packages.values().find(|p| p.name == short) {
+        return Some(details_for_package(pkg, mods));
+    }
+    if let Some(view) = graph.views.values().find(|v| v.name == short) {
+        return Some(details_for_view(view, mods));
     }
 
     None
 }
 
+fn details_for_requirement(
+    req: &syssur_model::RequirementNode,
+    graph: &DefinitionGraph,
+    mods: ElementModifiers,
+) -> ResolvedDetails {
+    ResolvedDetails {
+        key: format!("req:{}:{:?}:{:?}", req.id, req.short_id, req.doc),
+        kind_label: if req.is_usage {
+            "Requirement Usage".to_string()
+        } else {
+            "Requirement Definition".to_string()
+        },
+        kind_hint: Some(if req.is_usage { "requirement" } else { "requirement def" }.into()),
+        qualified_name: req.id.as_str().to_string(),
+        short_name: req.name.clone(),
+        source_file: req.span.file.clone(),
+        origin_label: None,
+        short_id: req.short_id.clone(),
+        doc: req.doc.clone(),
+        type_name: None,
+        multiplicity: None,
+        modifiers: graph
+            .element_modifiers
+            .get(&req.id)
+            .cloned()
+            .unwrap_or(mods),
+        supports_doc: true,
+        supports_short_id: true,
+        supports_type: false,
+        supports_def_usage: true,
+        supports_modifiers: true,
+        block_editor: None,
+    }
+}
+
+fn details_for_state(
+    st: &StateNode,
+    graph: &DefinitionGraph,
+    mods: ElementModifiers,
+) -> ResolvedDetails {
+    ResolvedDetails {
+        key: format!("state:{}:{:?}", st.id, st.doc),
+        kind_label: if st.is_def {
+            "State Definition".to_string()
+        } else {
+            "State Usage".to_string()
+        },
+        kind_hint: Some(if st.is_def { "state def" } else { "state" }.into()),
+        qualified_name: st.id.as_str().to_string(),
+        short_name: st.name.clone(),
+        source_file: st.span.file.clone(),
+        origin_label: None,
+        short_id: None,
+        doc: st.doc.clone(),
+        type_name: None,
+        multiplicity: None,
+        modifiers: graph.element_modifiers.get(&st.id).cloned().unwrap_or(mods),
+        supports_doc: true,
+        supports_short_id: false,
+        supports_type: false,
+        supports_def_usage: true,
+        supports_modifiers: true,
+        block_editor: None,
+    }
+}
+
+fn details_for_action(
+    act: &ActionNode,
+    graph: &DefinitionGraph,
+    mods: ElementModifiers,
+) -> ResolvedDetails {
+    let kind_label = match act.kind {
+        ActionNodeKind::Action => "Action",
+        ActionNodeKind::Start => "Start Node",
+        ActionNodeKind::Done => "Done Node",
+        ActionNodeKind::Fork => "Fork Node",
+        ActionNodeKind::Join => "Join Node",
+        ActionNodeKind::Decide => "Decide Node",
+        ActionNodeKind::Merge => "Merge Node",
+    };
+    ResolvedDetails {
+        key: format!("act:{}:{:?}", act.id, act.doc),
+        kind_label: kind_label.to_string(),
+        kind_hint: None,
+        qualified_name: act.id.as_str().to_string(),
+        short_name: act.name.clone(),
+        source_file: act.span.file.clone(),
+        origin_label: None,
+        short_id: None,
+        doc: act.doc.clone(),
+        type_name: None,
+        multiplicity: None,
+        modifiers: graph
+            .element_modifiers
+            .get(&act.id)
+            .cloned()
+            .unwrap_or(mods),
+        supports_doc: act.kind == ActionNodeKind::Action,
+        supports_short_id: false,
+        supports_type: false,
+        supports_def_usage: act.kind == ActionNodeKind::Action,
+        supports_modifiers: act.kind == ActionNodeKind::Action,
+        block_editor: None,
+    }
+}
+
+fn details_for_generic(
+    elem: &syssur_model::SysmlElement,
+    graph: &DefinitionGraph,
+    mods: ElementModifiers,
+) -> ResolvedDetails {
+    ResolvedDetails {
+        key: format!("elem:{}:{:?}:{:?}", elem.id, elem.doc, elem.short_id),
+        kind_label: format!(
+            "{:?}{}",
+            elem.kind,
+            if elem.is_def { " Def" } else { "" }
+        ),
+        kind_hint: None,
+        qualified_name: elem.id.as_str().to_string(),
+        short_name: elem.name.clone(),
+        source_file: elem.span.file.clone(),
+        origin_label: elem
+            .type_ref
+            .as_ref()
+            .map(|t| format!(": {}", t.short_name())),
+        short_id: elem.short_id.clone(),
+        doc: elem.doc.clone(),
+        type_name: elem.type_ref.as_ref().map(|t| t.short_name().to_string()),
+        multiplicity: None,
+        modifiers: graph
+            .element_modifiers
+            .get(&elem.id)
+            .cloned()
+            .unwrap_or(mods),
+        supports_doc: true,
+        supports_short_id: true,
+        supports_type: false,
+        supports_def_usage: true,
+        supports_modifiers: true,
+        block_editor: None,
+    }
+}
+
+fn details_for_port_def(pdef: &syssur_model::PortDef, mods: ElementModifiers) -> ResolvedDetails {
+    let dir_str = match pdef.direction {
+        PortDirection::In => "in",
+        PortDirection::Out => "out",
+        PortDirection::InOut => "inout",
+    };
+    let origin_label = Some(match &pdef.item_type {
+        Some(item) => format!("{dir_str} {item}"),
+        None => dir_str.to_string(),
+    });
+    ResolvedDetails {
+        key: format!("portdef:{}:{:?}:{:?}", pdef.id, pdef.direction, pdef.item_type),
+        kind_label: "Port Definition".to_string(),
+        kind_hint: Some("port def".into()),
+        qualified_name: pdef.id.as_str().to_string(),
+        short_name: pdef.name.clone(),
+        source_file: pdef.span.file.clone(),
+        origin_label,
+        short_id: None,
+        doc: None,
+        type_name: pdef.item_type.clone(),
+        multiplicity: None,
+        modifiers: mods,
+        supports_doc: true,
+        supports_short_id: false,
+        supports_type: false,
+        supports_def_usage: true,
+        supports_modifiers: true,
+        block_editor: None,
+    }
+}
+
+fn details_for_part_def(
+    graph: &DefinitionGraph,
+    pd: &syssur_model::PartDef,
+    mods: ElementModifiers,
+    resolved_node_key: Option<String>,
+) -> ResolvedDetails {
+    let eff_attrs: Vec<(AttributeUsage, bool)> = graph
+        .effective_attributes_for_def(&pd.id)
+        .into_iter()
+        .map(|a| {
+            let inherited = matches!(a.origin, FeatureOrigin::Inherited(_));
+            (a, inherited)
+        })
+        .collect();
+    let eff_ports: Vec<BlockPortSummary> = graph
+        .effective_ports_for_def(&pd.id)
+        .into_iter()
+        .map(|p| BlockPortSummary {
+            name: p.name,
+            type_name: p.port_def.as_ref().map(|d| d.short_name().to_string()),
+            is_conjugated: p.is_conjugated,
+            direction: p.direction,
+        })
+        .collect();
+    let specializes_str = pd
+        .specializes
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let attr_sig: Vec<String> = eff_attrs.iter().map(|(a, _)| a.display_label()).collect();
+    let port_sig: Vec<String> = eff_ports
+        .iter()
+        .map(|p| format!("{}:{}", p.name, p.is_conjugated))
+        .collect();
+    ResolvedDetails {
+        key: format!(
+            "partdef:{}:{}:{:?}:{:?}",
+            pd.id, specializes_str, attr_sig, port_sig
+        ),
+        kind_label: "Part Definition".to_string(),
+        kind_hint: Some("part def".into()),
+        qualified_name: pd.id.as_str().to_string(),
+        short_name: pd.name.clone(),
+        source_file: pd.span.file.clone(),
+        origin_label: if pd.specializes.is_empty() {
+            None
+        } else {
+            Some(format!(":> {specializes_str}"))
+        },
+        short_id: None,
+        doc: None,
+        type_name: None,
+        multiplicity: None,
+        modifiers: graph
+            .element_modifiers
+            .get(&pd.id)
+            .cloned()
+            .unwrap_or(mods),
+        supports_doc: true,
+        supports_short_id: false,
+        supports_type: false,
+        supports_def_usage: true,
+        supports_modifiers: true,
+        block_editor: Some(BlockEditContext {
+            owner_name: pd.name.clone(),
+            is_part_def: true,
+            specializes: specializes_str,
+            attributes: eff_attrs,
+            ports: eff_ports,
+            node_key: resolved_node_key,
+        }),
+    }
+}
+
+fn details_for_part_usage(
+    graph: &DefinitionGraph,
+    pu: &syssur_model::PartUsage,
+    path: Option<&InstancePath>,
+    mods: ElementModifiers,
+    resolved_node_key: Option<String>,
+) -> ResolvedDetails {
+    let origin_label = match &pu.origin {
+        FeatureOrigin::Owned => None,
+        FeatureOrigin::Inherited(b) => Some(format!("^ Inherited from {}", b.short_name())),
+        FeatureOrigin::Subsetted(t) => Some(format!(":> Subsets {}", t.short_name())),
+        FeatureOrigin::Redefined(t) => Some(format!(":>> Redefines {}", t.short_name())),
+    };
+    let mut by_attr: BTreeMap<String, (AttributeUsage, bool)> = BTreeMap::new();
+    if let Some(ref td) = pu.type_def {
+        for attr in graph.effective_attributes_for_def(td) {
+            by_attr.insert(attr.name.clone(), (attr, true));
+        }
+    }
+    for local in &pu.attributes {
+        let mut merged = local.clone();
+        if let Some((prev, _)) = by_attr.get(&merged.name) {
+            if merged.type_name.is_none() {
+                merged.type_name = prev.type_name.clone();
+            }
+            if merged.value_expr.is_none() {
+                merged.value_expr = prev.value_expr.clone();
+            }
+        }
+        by_attr.insert(merged.name.clone(), (merged, false));
+    }
+    let merged_attrs: Vec<(AttributeUsage, bool)> = by_attr.into_values().collect();
+    let eff_ports_raw = if pu.ports.is_empty() {
+        pu.type_def
+            .as_ref()
+            .map(|td| graph.effective_ports_for_def(td))
+            .unwrap_or_default()
+    } else {
+        pu.ports.clone()
+    };
+    let eff_ports: Vec<BlockPortSummary> = eff_ports_raw
+        .into_iter()
+        .map(|p| BlockPortSummary {
+            name: p.name,
+            type_name: p.port_def.as_ref().map(|d| d.short_name().to_string()),
+            is_conjugated: p.is_conjugated,
+            direction: p.direction,
+        })
+        .collect();
+    let attr_sig: Vec<String> = merged_attrs
+        .iter()
+        .map(|(a, inh)| format!("{}({})", a.display_label(), inh))
+        .collect();
+    let port_sig: Vec<String> = eff_ports
+        .iter()
+        .map(|p| format!("{}:{}", p.name, p.is_conjugated))
+        .collect();
+    ResolvedDetails {
+        key: format!(
+            "part:{}:{:?}:{:?}:{:?}:{:?}",
+            pu.id,
+            pu.type_def.as_ref().map(|t| t.as_str()),
+            pu.multiplicity,
+            attr_sig,
+            port_sig
+        ),
+        kind_label: "Part Usage".to_string(),
+        kind_hint: Some("part".into()),
+        qualified_name: path
+            .map(ToString::to_string)
+            .unwrap_or_else(|| pu.id.as_str().to_string()),
+        short_name: pu.name.clone(),
+        source_file: pu.span.file.clone(),
+        origin_label,
+        short_id: None,
+        doc: None,
+        type_name: pu.type_def.as_ref().map(|t| t.short_name().to_string()),
+        multiplicity: pu.multiplicity,
+        modifiers: graph
+            .element_modifiers
+            .get(&pu.id)
+            .cloned()
+            .unwrap_or(mods),
+        supports_doc: true,
+        supports_short_id: false,
+        supports_type: true,
+        supports_def_usage: true,
+        supports_modifiers: true,
+        block_editor: Some(BlockEditContext {
+            owner_name: pu.name.clone(),
+            is_part_def: false,
+            specializes: String::new(),
+            attributes: merged_attrs,
+            ports: eff_ports,
+            node_key: resolved_node_key,
+        }),
+    }
+}
+
+fn details_for_package(pkg: &syssur_model::PackageNode, mods: ElementModifiers) -> ResolvedDetails {
+    ResolvedDetails {
+        key: format!("pkg:{}", pkg.id),
+        kind_label: "Package".to_string(),
+        kind_hint: Some("package".into()),
+        qualified_name: pkg.id.as_str().to_string(),
+        short_name: pkg.name.clone(),
+        source_file: pkg.span.file.clone(),
+        origin_label: None,
+        short_id: None,
+        doc: None,
+        type_name: None,
+        multiplicity: None,
+        modifiers: mods,
+        supports_doc: true,
+        supports_short_id: false,
+        supports_type: false,
+        supports_def_usage: false,
+        supports_modifiers: false,
+        block_editor: None,
+    }
+}
+
+fn details_for_view(view: &syssur_model::ViewDef, mods: ElementModifiers) -> ResolvedDetails {
+    ResolvedDetails {
+        key: format!("view:{}", view.id),
+        kind_label: format!("{:?} View", view.kind),
+        kind_hint: Some(if view.is_usage { "view" } else { "view def" }.into()),
+        qualified_name: view.id.as_str().to_string(),
+        short_name: view.name.clone(),
+        source_file: view.span.file.clone(),
+        origin_label: None,
+        short_id: None,
+        doc: None,
+        type_name: None,
+        multiplicity: None,
+        modifiers: mods,
+        supports_doc: false,
+        supports_short_id: false,
+        supports_type: false,
+        supports_def_usage: true,
+        supports_modifiers: false,
+        block_editor: None,
+    }
+}
+
 fn find_state_recursive<'a>(
     graph: &'a DefinitionGraph,
     target: &ElementId,
+    exact_only: bool,
 ) -> Option<&'a StateNode> {
-    fn search<'a>(node: &'a StateNode, target: &ElementId, short: &str) -> Option<&'a StateNode> {
-        if &node.id == target || node.name == short {
+    fn search<'a>(
+        node: &'a StateNode,
+        target: &ElementId,
+        short: &str,
+        exact_only: bool,
+    ) -> Option<&'a StateNode> {
+        if &node.id == target || (!exact_only && node.name == short) {
             return Some(node);
         }
         for child in &node.children {
-            if let Some(found) = search(child, target, short) {
+            if let Some(found) = search(child, target, short, exact_only) {
                 return Some(found);
             }
         }
@@ -1126,19 +1567,25 @@ fn find_state_recursive<'a>(
     graph
         .states
         .values()
-        .find_map(|root| search(root, target, short))
+        .find_map(|root| search(root, target, short, exact_only))
 }
 
 fn find_action_recursive<'a>(
     graph: &'a DefinitionGraph,
     target: &ElementId,
+    exact_only: bool,
 ) -> Option<&'a ActionNode> {
-    fn search<'a>(node: &'a ActionNode, target: &ElementId, short: &str) -> Option<&'a ActionNode> {
-        if &node.id == target || node.name == short {
+    fn search<'a>(
+        node: &'a ActionNode,
+        target: &ElementId,
+        short: &str,
+        exact_only: bool,
+    ) -> Option<&'a ActionNode> {
+        if &node.id == target || (!exact_only && node.name == short) {
             return Some(node);
         }
         for child in &node.children {
-            if let Some(found) = search(child, target, short) {
+            if let Some(found) = search(child, target, short, exact_only) {
                 return Some(found);
             }
         }
@@ -1148,23 +1595,25 @@ fn find_action_recursive<'a>(
     graph
         .actions
         .values()
-        .find_map(|root| search(root, target, short))
+        .find_map(|root| search(root, target, short, exact_only))
 }
 
 fn find_part_usage<'a>(
     graph: &'a DefinitionGraph,
     target: &ElementId,
+    exact_only: bool,
 ) -> Option<&'a syssur_model::PartUsage> {
     fn search_usage<'a>(
         u: &'a syssur_model::PartUsage,
         target: &ElementId,
         short: &str,
+        exact_only: bool,
     ) -> Option<&'a syssur_model::PartUsage> {
-        if &u.id == target || u.name == short {
+        if &u.id == target || (!exact_only && u.name == short) {
             return Some(u);
         }
         for child in &u.nested_parts {
-            if let Some(found) = search_usage(child, target, short) {
+            if let Some(found) = search_usage(child, target, short, exact_only) {
                 return Some(found);
             }
         }
@@ -1173,13 +1622,13 @@ fn find_part_usage<'a>(
 
     let short = target.short_name();
     for u in graph.top_level_parts.values() {
-        if let Some(found) = search_usage(u, target, short) {
+        if let Some(found) = search_usage(u, target, short, exact_only) {
             return Some(found);
         }
     }
     for pd in graph.part_defs.values() {
         for u in &pd.parts {
-            if let Some(found) = search_usage(u, target, short) {
+            if let Some(found) = search_usage(u, target, short, exact_only) {
                 return Some(found);
             }
         }
@@ -1189,6 +1638,7 @@ fn find_part_usage<'a>(
 
 fn show_code_tab(
     ui: &mut Ui,
+    draft: &mut InspectorDraft,
     graph: &DefinitionGraph,
     collab: &ProjectCollab,
     active_file: &str,
@@ -1211,22 +1661,33 @@ fn show_code_tab(
     });
     ui.separator();
 
-    let diag_reserve = if graph.diagnostics.is_empty() {
-        0.0
+    if draft.diag_panel_height <= 0.0 {
+        draft.diag_panel_height = 220.0;
+    }
+
+    let has_diags = !graph.diagnostics.is_empty();
+    let total_h = ui.available_height();
+    let splitter_h = 8.0;
+    let min_editor_h = 100.0;
+    let min_diag_h = 80.0;
+    let max_diag_h = (total_h - min_editor_h - splitter_h).max(min_diag_h);
+    let diag_h = draft.diag_panel_height.clamp(min_diag_h, max_diag_h);
+    let editor_h = if has_diags {
+        (total_h - diag_h - splitter_h).max(min_editor_h)
     } else {
-        110.0
+        total_h.max(160.0)
     };
-    let editor_h = (ui.available_height() - diag_reserve).max(160.0);
 
     if let Some(doc) = collab.files.get(active_file) {
         let mut text = doc.text();
         let mut changed = false;
         ScrollArea::vertical()
             .id_salt("code_editor_scroll")
+            .auto_shrink([false, false])
             .max_height(editor_h)
             .show(ui, |ui| {
                 let resp = ui.add_sized(
-                    [ui.available_width(), editor_h.max(240.0)],
+                    [ui.available_width(), editor_h.max(160.0)],
                     TextEdit::multiline(&mut text).code_editor(),
                 );
                 changed = resp.changed();
@@ -1239,7 +1700,33 @@ fn show_code_tab(
         }
     }
 
-    if !graph.diagnostics.is_empty() {
+    if has_diags {
+        let (splitter_rect, splitter_resp) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), splitter_h), egui::Sense::drag());
+        if splitter_resp.hovered() || splitter_resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        }
+        if splitter_resp.dragged() {
+            draft.diag_panel_height =
+                (diag_h - splitter_resp.drag_delta().y).clamp(min_diag_h, max_diag_h);
+        }
+        let bar_color = if splitter_resp.dragged() {
+            Color32::from_rgb(130, 185, 255)
+        } else if splitter_resp.hovered() {
+            Color32::from_gray(170)
+        } else {
+            Color32::from_gray(95)
+        };
+        let y = splitter_rect.center().y;
+        ui.painter().line_segment(
+            [
+                egui::pos2(splitter_rect.left() + 4.0, y),
+                egui::pos2(splitter_rect.right() - 4.0, y),
+            ],
+            egui::Stroke::new(2.0, bar_color),
+        );
+        splitter_resp.on_hover_text("Drag to resize diagnostics");
+
         let error_count = graph
             .diagnostics
             .iter()
@@ -1250,7 +1737,6 @@ fn show_code_tab(
             .iter()
             .filter(|d| d.severity == DiagnosticSeverity::Warning)
             .count();
-        ui.separator();
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!("Errors: {error_count}"))
@@ -1274,7 +1760,8 @@ fn show_code_tab(
         });
         ScrollArea::vertical()
             .id_salt("code_diags_scroll")
-            .max_height(110.0)
+            .auto_shrink([false, false])
+            .max_height((diag_h - 26.0).max(48.0))
             .show(ui, |ui| {
                 for diag in graph.diagnostics.iter().take(200) {
                     let (tag, color) = match diag.severity {
@@ -1293,4 +1780,63 @@ fn show_code_tab(
     }
 
     action
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syssur_lang::SysmlEngine;
+
+    #[test]
+    fn resolve_details_covers_every_sysml_element_type() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "all.sysml".to_string(),
+            r#"package Pkg {
+    view Overview : GeneralView {
+        expose Pkg::*;
+    }
+    port def PowerPort {
+        in flowPower;
+    }
+    part def Wheel;
+    part def Vehicle {
+        part wheel : Wheel;
+    }
+    part rover : Vehicle;
+    action Drive {
+        action accel;
+    }
+    state Lifecycle {
+        state Ready;
+    }
+    requirement <'REQ-1'> RangeReq {
+        doc /* Vehicle range requirement */
+    }
+    use case DriveCase;
+}
+"#
+            .to_string(),
+        );
+        let graph = SysmlEngine::parse_workspace(&files).graph;
+
+        let check = |id: &str, expected_kind: &str| {
+            let det = resolve_details(&graph, None, &ElementId::new(id), None)
+                .unwrap_or_else(|| panic!("expected details for {id}"));
+            assert_eq!(det.kind_label, expected_kind, "unexpected kind for {id}");
+        };
+
+        check("Pkg", "Package");
+        check("Pkg::Overview", "General View");
+        check("Pkg::PowerPort", "Port Definition");
+        check("Pkg::Wheel", "Part Definition");
+        check("Pkg::Vehicle::wheel", "Part Usage");
+        check("Pkg::rover", "Part Usage");
+        check("Pkg::Drive", "Action");
+        check("Pkg::Drive::accel", "Action");
+        check("Pkg::Lifecycle", "State Usage");
+        check("Pkg::Lifecycle::Ready", "State Usage");
+        check("Pkg::RangeReq", "Requirement Usage");
+        check("Pkg::DriveCase", "UseCase");
+    }
 }
