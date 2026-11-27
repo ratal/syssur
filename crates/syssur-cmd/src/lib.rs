@@ -28,6 +28,27 @@ pub fn format_sysml_name(name: &str) -> String {
     }
 }
 
+/// Formats a possibly dotted/qualified SysML path segment-by-segment so
+/// `battery.powerOut` stays `battery.powerOut` rather than `'battery.powerOut'`.
+pub fn format_sysml_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.contains("::") {
+        trimmed
+            .split("::")
+            .map(format_sysml_path)
+            .collect::<Vec<_>>()
+            .join("::")
+    } else if trimmed.contains('.') {
+        trimmed
+            .split('.')
+            .map(format_sysml_name)
+            .collect::<Vec<_>>()
+            .join(".")
+    } else {
+        format_sysml_name(trimmed)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyssurCommand {
     CreatePackage {
@@ -249,6 +270,12 @@ pub enum SyssurCommand {
         def_name: String,
         specializes: String,
     },
+    DeleteSpan {
+        file: String,
+        start: usize,
+        end: usize,
+        label: String,
+    },
 }
 
 impl SyssurCommand {
@@ -369,6 +396,7 @@ impl SyssurCommand {
                     format!("{def_name} :> {specializes}")
                 }
             }
+            Self::DeleteSpan { label, .. } => format!("delete {label}"),
         }
     }
 
@@ -409,7 +437,8 @@ impl SyssurCommand {
             | Self::CreateAttribute { file, .. }
             | Self::UpdateAttribute { file, .. }
             | Self::DeleteAttribute { file, .. }
-            | Self::UpdatePartDefSpecializes { file, .. } => file,
+            | Self::UpdatePartDefSpecializes { file, .. }
+            | Self::DeleteSpan { file, .. } => file,
         }
     }
 }
@@ -930,6 +959,9 @@ pub fn plan_text_edit(cmd: &SyssurCommand, current_text: &str) -> Result<TextEdi
             specializes,
             ..
         } => update_part_def_specializes_edit(&file, current_text, def_name, specializes),
+        SyssurCommand::DeleteSpan { start, end, .. } => {
+            delete_span_edit(&file, current_text, *start, *end)
+        }
     }
 }
 
@@ -1424,6 +1456,49 @@ fn delete_element_edit(
     })
 }
 
+fn delete_span_edit(
+    file: &str,
+    text: &str,
+    start: usize,
+    end: usize,
+) -> Result<TextEdit, CommandError> {
+    if start >= end
+        || end > text.len()
+        || !text.is_char_boundary(start)
+        || !text.is_char_boundary(end)
+    {
+        return Err(CommandError::MissingContainer(
+            format!("span {start}..{end}"),
+            file.to_string(),
+        ));
+    }
+
+    let line_start = text[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let leading_only_ws = text[line_start..start]
+        .bytes()
+        .all(|b| b == b' ' || b == b'\t');
+    let del_start = if leading_only_ws { line_start } else { start };
+
+    let mut del_end = end;
+    while del_end < text.len() && matches!(text.as_bytes()[del_end], b' ' | b'\t') {
+        del_end += 1;
+    }
+    if leading_only_ws {
+        if text[del_end..].starts_with("\r\n") {
+            del_end += 2;
+        } else if text[del_end..].starts_with('\n') {
+            del_end += 1;
+        }
+    }
+
+    Ok(TextEdit {
+        file: file.to_string(),
+        start: del_start,
+        end: del_end,
+        replacement: String::new(),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn create_sysml_element_edit(
     file: &str,
@@ -1556,12 +1631,12 @@ fn create_relationship_edit(
     let src_fmt = if source == "start" {
         "start".to_string()
     } else {
-        format_sysml_name(source)
+        format_sysml_path(source)
     };
     let dst_fmt = if target == "done" {
         "done".to_string()
     } else {
-        format_sysml_name(target)
+        format_sysml_path(target)
     };
 
     match kind {
@@ -1992,12 +2067,12 @@ fn update_transition_edit(
     let src_fmt = if source == "start" {
         "start".to_string()
     } else {
-        format_sysml_name(source)
+        format_sysml_path(source)
     };
     let dst_fmt = if target == "done" {
         "done".to_string()
     } else {
-        format_sysml_name(target)
+        format_sysml_path(target)
     };
 
     let mut offset = 0;
@@ -2190,12 +2265,12 @@ fn update_succession_guard_edit(
     let src_fmt = if source == "start" {
         "start".to_string()
     } else {
-        format_sysml_name(source)
+        format_sysml_path(source)
     };
     let dst_fmt = if target == "done" {
         "done".to_string()
     } else {
-        format_sysml_name(target)
+        format_sysml_path(target)
     };
     let guard_trimmed = new_guard.trim();
 
@@ -2530,5 +2605,43 @@ package PkgB {
         let s5 = apply_text_edit(&s4, &plan_text_edit(&del_cmd, &s4).unwrap());
         assert!(!s5.contains("dryMass"));
         assert!(s5.contains("attribute maxSpeed : Real = 5.5;"));
+    }
+
+    #[test]
+    fn delete_span_removes_connection_line_cleanly() {
+        let initial = "package P {\n    part def Sys {\n        part a;\n        part b;\n        connect a.p to b.q;\n    }\n}\n";
+        let stmt = "connect a.p to b.q;";
+        let start = initial.find(stmt).unwrap();
+        let end = start + stmt.len();
+        let cmd = SyssurCommand::DeleteSpan {
+            file: "p.sysml".into(),
+            start,
+            end,
+            label: "Connection".into(),
+        };
+        let edited = apply_text_edit(initial, &plan_text_edit(&cmd, initial).unwrap());
+        assert_eq!(
+            edited,
+            "package P {\n    part def Sys {\n        part a;\n        part b;\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn create_relationship_preserves_dotted_port_paths() {
+        let initial = "package P {\n    part def Sys {\n        part battery;\n        part motor;\n    }\n}\n";
+        let cmd = SyssurCommand::CreateRelationship {
+            file: "p.sysml".into(),
+            owner_scope: "Sys".into(),
+            kind: "flow".into(),
+            source: "battery.powerOut".into(),
+            target: "motor.powerIn".into(),
+            label: None,
+            guard: None,
+        };
+        let edited = apply_text_edit(initial, &plan_text_edit(&cmd, initial).unwrap());
+        assert!(
+            edited.contains("flow from battery.powerOut to motor.powerIn;"),
+            "expected unquoted dotted path, got:\n{edited}"
+        );
     }
 }

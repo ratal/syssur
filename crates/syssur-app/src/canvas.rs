@@ -5,8 +5,8 @@
 //! optional toggleable palette, and Explorer drag-to-expose support.
 
 use crate::catalog::{
-    catalog_item_row, catalog_relationships, show_create_submenus, show_optional_palette,
-    SysmlCatalogItem,
+    catalog_item_row, catalog_relationships, has_items_for_context, show_create_submenus,
+    show_optional_palette, CreateContext, SysmlCatalogItem,
 };
 use crate::i18n::{tr, Locale, TextKey};
 use egui::{
@@ -56,6 +56,7 @@ pub struct WireDraft {
     pub source: PortEndpoint,
     pub current_world: Pos2,
     pub hovered_target: Option<(PortEndpoint, PortCompatibility)>,
+    pub rel_keyword: Option<&'static str>,
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +126,7 @@ pub enum CanvasAction {
     ConnectPorts {
         source: PortEndpoint,
         target: PortEndpoint,
+        rel_keyword: Option<String>,
     },
     IncompatibleWireDrop {
         reason: String,
@@ -194,6 +196,9 @@ pub enum CanvasAction {
         element: ElementId,
         file: String,
     },
+    DeleteEdge {
+        index: usize,
+    },
     JumpToSource {
         file: String,
     },
@@ -257,8 +262,9 @@ pub struct DiagramCanvas {
     pub selected_edge: Option<usize>,
     context_node: Option<InstancePath>,
     context_port: Option<(String, String, String)>,
+    context_edge: Option<usize>,
     context_world_pos: Option<Pos2>,
-    wire_armed_port: Option<PortEndpoint>,
+    wire_armed_port: Option<(PortEndpoint, Option<&'static str>)>,
     context_search: String,
     wire_draft: Option<WireDraft>,
     handle_drag: Option<NodeHandleDrag>,
@@ -283,6 +289,7 @@ impl Default for DiagramCanvas {
             selected_edge: None,
             context_node: None,
             context_port: None,
+            context_edge: None,
             context_world_pos: None,
             wire_armed_port: None,
             context_search: String::new(),
@@ -311,6 +318,41 @@ impl DiagramCanvas {
         self.wire_armed_port = None;
         self.pending_choice = None;
         self.rel_pick = None;
+    }
+
+    pub fn arm_port_wire(&mut self, layout: &LayoutOutput, node_key: &str, port_name: &str) {
+        if let Some(pnode) = layout.nodes.get(node_key) {
+            if let Some(pp) = pnode.ports.iter().find(|p| p.name == port_name) {
+                self.wire_armed_port = Some((
+                    PortEndpoint {
+                        node_path: pnode.path.clone(),
+                        node_label: pnode.label.clone(),
+                        port_name: pp.name.clone(),
+                        port_type: pp.type_label.clone(),
+                        direction: pp.direction,
+                        is_conjugated: pp.is_conjugated,
+                        world_pos: Pos2::new(pp.anchor.x, pp.anchor.y),
+                    },
+                    None,
+                ));
+            }
+        }
+    }
+
+    fn port_wire_compatibility(
+        rel_keyword: Option<&str>,
+        source: &PortEndpoint,
+        target: &PortEndpoint,
+    ) -> PortCompatibility {
+        if matches!(rel_keyword, Some("allocate" | "dependency" | "binding")) {
+            return PortCompatibility::Compatible;
+        }
+        check_port_direction_and_type(
+            source.port_type.as_deref(),
+            source.direction.effective_direction(source.is_conjugated),
+            target.port_type.as_deref(),
+            target.direction.effective_direction(target.is_conjugated),
+        )
     }
 
     pub fn rebuild_spatial_index(&mut self, layout: &LayoutOutput) {
@@ -599,8 +641,9 @@ impl DiagramCanvas {
             }
         }
 
-        // Drag start priority: 0) Corner Resize -> 1) Port (plain drag -> Reposition on border; Shift+Drag -> Wire) -> 2) 4-way handle -> 3) Free Node Move -> 4) Background pan
+        // Drag start priority: 0) Corner Resize -> 1) Port (Shift+Drag or relationship tool -> Wire; plain drag -> Reposition) -> 2) 4-way handle -> 3) Free Node Move -> 4) Background pan
         let shift_held = ui.input(|i| i.modifiers.shift);
+        let rel_tool_kw = active_tool.filter(|t| t.is_relationship).map(|t| t.keyword);
         if self.node_resize.is_none()
             && self.wire_draft.is_none()
             && self.handle_drag.is_none()
@@ -618,12 +661,15 @@ impl DiagramCanvas {
                         orig_rect: rnode.rect,
                     });
                 } else if let Some(src_port) = self.hit_test_port(&visible_nodes, press_pos, origin) {
-                    if shift_held {
+                    if self.wire_armed_port.is_some() || self.rel_pick.is_some() {
+                        // Let primary click release complete 2-click port/relationship wiring.
+                    } else if shift_held || rel_tool_kw.is_some() {
                         let world_pos = self.screen_to_world(press_pos, origin);
                         self.wire_draft = Some(WireDraft {
                             source: src_port,
                             current_world: world_pos,
                             hovered_target: None,
+                            rel_keyword: rel_tool_kw,
                         });
                     } else {
                         let node_key = src_port.node_path.canonical_key();
@@ -657,7 +703,10 @@ impl DiagramCanvas {
                         current_world: world_pos,
                         hovered_target: None,
                     });
-                } else if active_tool.is_none() && self.rel_pick.is_none() {
+                } else if active_tool.is_none()
+                    && self.rel_pick.is_none()
+                    && self.wire_armed_port.is_none()
+                {
                     if let Some(hit_node) = Self::hit_test_node_static(
                         self.pan,
                         self.zoom,
@@ -793,14 +842,10 @@ impl DiagramCanvas {
                                 && target.port_name == draft.source.port_name)
                         })
                         .map(|target| {
-                            let compat = check_port_direction_and_type(
-                                draft.source.port_type.as_deref(),
-                                draft
-                                    .source
-                                    .direction
-                                    .effective_direction(draft.source.is_conjugated),
-                                target.port_type.as_deref(),
-                                target.direction.effective_direction(target.is_conjugated),
+                            let compat = Self::port_wire_compatibility(
+                                draft.rel_keyword,
+                                &draft.source,
+                                &target,
                             );
                             (target, compat)
                         });
@@ -813,7 +858,11 @@ impl DiagramCanvas {
                                 action = Some(CanvasAction::ConnectPorts {
                                     source: done.source,
                                     target,
+                                    rel_keyword: done.rel_keyword.map(str::to_string),
                                 });
+                                if done.rel_keyword.is_some() {
+                                    *active_tool = None;
+                                }
                             }
                             PortCompatibility::DirectionMismatch {
                                 source_dir,
@@ -979,26 +1028,23 @@ impl DiagramCanvas {
 
         // 2-click relationship wiring, 2-click port wiring, or active catalog tool placement
         if let Some(cp) = click_pos {
-            if let Some(src_ep) = self.wire_armed_port.take() {
+            if let Some((src_ep, rel_kw)) = self.wire_armed_port.take() {
                 if let Some(target) =
                     Self::hit_test_port_static(self.pan, self.zoom, &visible_nodes, cp, origin)
                 {
                     if !(target.node_path == src_ep.node_path
                         && target.port_name == src_ep.port_name)
                     {
-                        match check_port_direction_and_type(
-                            src_ep.port_type.as_deref(),
-                            src_ep
-                                .direction
-                                .effective_direction(src_ep.is_conjugated),
-                            target.port_type.as_deref(),
-                            target.direction.effective_direction(target.is_conjugated),
-                        ) {
+                        match Self::port_wire_compatibility(rel_kw, &src_ep, &target) {
                             PortCompatibility::Compatible => {
                                 action = Some(CanvasAction::ConnectPorts {
                                     source: src_ep,
                                     target,
+                                    rel_keyword: rel_kw.map(str::to_string),
                                 });
+                                if rel_kw.is_some() {
+                                    *active_tool = None;
+                                }
                             }
                             PortCompatibility::DirectionMismatch {
                                 source_dir,
@@ -1024,7 +1070,23 @@ impl DiagramCanvas {
                     }
                 }
             } else if let Some(ref pick) = self.rel_pick.clone() {
-                if let Some(target_node) =
+                if let Some(target_port) =
+                    Self::hit_test_port_static(self.pan, self.zoom, &visible_nodes, cp, origin)
+                {
+                    if target_port.node_path != pick.source_path {
+                        action = Some(CanvasAction::CreateRelationship {
+                            rel_keyword: pick.rel_keyword.to_string(),
+                            source_path: pick.source_path.clone(),
+                            source_label: pick.source_label.clone(),
+                            target_label: format!(
+                                "{}.{}",
+                                target_port.node_label, target_port.port_name
+                            ),
+                        });
+                        self.rel_pick = None;
+                        *active_tool = None;
+                    }
+                } else if let Some(target_node) =
                     Self::hit_test_node_static(self.pan, self.zoom, &visible_nodes, cp, origin)
                 {
                     if target_node.path != pick.source_path {
@@ -1042,7 +1104,11 @@ impl DiagramCanvas {
                 }
             } else if let Some(tool) = *active_tool {
                 if tool.is_relationship {
-                    if let Some(src_node) =
+                    if let Some(src_port) =
+                        Self::hit_test_port_static(self.pan, self.zoom, &visible_nodes, cp, origin)
+                    {
+                        self.wire_armed_port = Some((src_port, Some(tool.keyword)));
+                    } else if let Some(src_node) =
                         Self::hit_test_node_static(self.pan, self.zoom, &visible_nodes, cp, origin)
                     {
                         self.rel_pick = Some(RelationshipPickState {
@@ -1079,6 +1145,9 @@ impl DiagramCanvas {
         if response.secondary_clicked() {
             if let Some(rc_pos) = response.interact_pointer_pos() {
                 self.context_world_pos = Some(self.screen_to_world(rc_pos, origin));
+                self.context_port = None;
+                self.context_node = None;
+                self.context_edge = None;
                 if let Some(port_ep) = self.hit_test_port(&visible_nodes, rc_pos, origin) {
                     let node_key = port_ep.node_path.canonical_key();
                     let file = meta_by_key
@@ -1086,23 +1155,57 @@ impl DiagramCanvas {
                         .map(|m| m.source_file.clone())
                         .unwrap_or_else(|| active_file.to_string());
                     self.context_port = Some((node_key.clone(), port_ep.port_name.clone(), file));
-                    self.context_node = None;
                     self.selected = None;
                     self.selected_port = Some((node_key, port_ep.port_name));
                     self.selected_edge = None;
                 } else {
-                    self.context_port = None;
-                    let hit = Self::hit_test_node_static(
-                        self.pan,
-                        self.zoom,
-                        &visible_nodes,
-                        rc_pos,
-                        origin,
-                    )
-                    .map(|n| n.path.clone());
-                    self.context_node = hit.clone();
-                    if let Some(path) = hit {
+                    let mut hit_leaf_rc = None;
+                    let mut hit_container_rc = None;
+                    for &node in visible_nodes.iter().rev() {
+                        let screen_rect = Rect::from_min_size(
+                            self.world_to_screen(Pos2::new(node.rect.x, node.rect.y), origin),
+                            Vec2::new(node.rect.w * self.zoom, node.rect.h * self.zoom),
+                        );
+                        if screen_rect.contains(rc_pos) {
+                            let is_container = visible_nodes.iter().any(|other| {
+                                other.path != node.path
+                                    && other.path.parent().as_ref() == Some(&node.path)
+                            });
+                            if is_container {
+                                if hit_container_rc.is_none() {
+                                    hit_container_rc = Some(node.path.clone());
+                                }
+                            } else {
+                                hit_leaf_rc = Some(node.path.clone());
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(path) = hit_leaf_rc {
+                        self.context_node = Some(path.clone());
                         self.selected = Some(path);
+                        self.selected_port = None;
+                        self.selected_edge = None;
+                    } else if let Some(edge_idx) = self
+                        .edge_tree
+                        .locate_in_envelope_intersecting(view_aabb)
+                        .find_map(|ie| {
+                            layout
+                                .edges
+                                .get(ie.index)
+                                .filter(|e| self.hit_test_edge(e, rc_pos, origin))
+                                .map(|_| ie.index)
+                        })
+                    {
+                        self.context_edge = Some(edge_idx);
+                        self.selected = None;
+                        self.selected_port = None;
+                        self.selected_edge = Some(edge_idx);
+                        action = Some(CanvasAction::SelectEdge { index: edge_idx });
+                    } else if let Some(path) = hit_container_rc {
+                        self.context_node = Some(path.clone());
+                        self.selected = Some(path);
+                        self.selected_port = None;
                         self.selected_edge = None;
                     }
                 }
@@ -1290,25 +1393,19 @@ impl DiagramCanvas {
 
         if let Some(ref draft) = self.wire_draft {
             self.paint_wire_draft(&clipped, draft, origin);
-        } else if let Some(ref src_ep) = self.wire_armed_port {
+        } else if let Some((ref src_ep, rel_kw)) = self.wire_armed_port {
             if let (Some(pointer), Some(world_ptr)) = (pointer_interact, pointer_world) {
                 let hovered = Self::hit_test_port_static(pan, zoom, &visible_nodes, pointer, origin)
                     .filter(|t| !(t.node_path == src_ep.node_path && t.port_name == src_ep.port_name))
                     .map(|target| {
-                        let compat = check_port_direction_and_type(
-                            src_ep.port_type.as_deref(),
-                            src_ep
-                                .direction
-                                .effective_direction(src_ep.is_conjugated),
-                            target.port_type.as_deref(),
-                            target.direction.effective_direction(target.is_conjugated),
-                        );
+                        let compat = Self::port_wire_compatibility(rel_kw, src_ep, &target);
                         (target, compat)
                     });
                 let preview = WireDraft {
                     source: src_ep.clone(),
                     current_world: world_ptr,
                     hovered_target: hovered,
+                    rel_keyword: rel_kw,
                 };
                 self.paint_wire_draft(&clipped, &preview, origin);
             }
@@ -1377,15 +1474,18 @@ impl DiagramCanvas {
                 if ui.button("Wire / Connect from Port...").clicked() {
                     if let Some(pnode) = layout.nodes.get(&node_key) {
                         if let Some(pp) = pnode.ports.iter().find(|p| p.name == port_name) {
-                            self.wire_armed_port = Some(PortEndpoint {
-                                node_path: pnode.path.clone(),
-                                node_label: pnode.label.clone(),
-                                port_name: pp.name.clone(),
-                                port_type: pp.type_label.clone(),
-                                direction: pp.direction,
-                                is_conjugated: pp.is_conjugated,
-                                world_pos: Pos2::new(pp.anchor.x, pp.anchor.y),
-                            });
+                            self.wire_armed_port = Some((
+                                PortEndpoint {
+                                    node_path: pnode.path.clone(),
+                                    node_label: pnode.label.clone(),
+                                    port_name: pp.name.clone(),
+                                    port_type: pp.type_label.clone(),
+                                    direction: pp.direction,
+                                    is_conjugated: pp.is_conjugated,
+                                    world_pos: Pos2::new(pp.anchor.x, pp.anchor.y),
+                                },
+                                None,
+                            ));
                         }
                     }
                     ui.close();
@@ -1425,6 +1525,31 @@ impl DiagramCanvas {
                 return;
             }
 
+            if let Some(edge_idx) = self.context_edge {
+                ui.set_min_width(220.0);
+                if let Some(edge) = layout.edges.get(edge_idx) {
+                    let title = edge
+                        .label
+                        .as_deref()
+                        .filter(|l| !l.trim().is_empty())
+                        .map(|l| format!("{:?}: {l}", edge.kind))
+                        .unwrap_or_else(|| format!("{:?} Connector", edge.kind));
+                    ui.label(RichText::new(title).strong());
+                    ui.separator();
+                    if ui
+                        .button(
+                            RichText::new("Delete Connector")
+                                .color(Color32::from_rgb(245, 115, 115)),
+                        )
+                        .clicked()
+                    {
+                        action = Some(CanvasAction::DeleteEdge { index: edge_idx });
+                        ui.close();
+                    }
+                }
+                return;
+            }
+
             ui.set_min_width(250.0);
             ui.add(
                 egui::TextEdit::singleline(&mut self.context_search)
@@ -1455,19 +1580,11 @@ impl DiagramCanvas {
                     let ctx_world = self
                         .context_world_pos
                         .map(|w| syssur_layout::Point2 { x: w.x, y: w.y });
+                    let inside_ctx = CreateContext::InsideNode(node.shape);
+                    let can_create_inside = has_items_for_context(inside_ctx);
                     if !q.is_empty() {
-                        if let Some(item) = show_create_submenus(ui, &q) {
-                            action = Some(CanvasAction::PlaceCatalogItem {
-                                item,
-                                container: Some(ctx_path.clone()),
-                                file: file.clone(),
-                                world_pos: ctx_world,
-                            });
-                            ui.close();
-                        }
-                    } else {
-                        ui.menu_button("Create inside...", |ui| {
-                            if let Some(item) = show_create_submenus(ui, "") {
+                        if can_create_inside {
+                            if let Some(item) = show_create_submenus(ui, &q, inside_ctx) {
                                 action = Some(CanvasAction::PlaceCatalogItem {
                                     item,
                                     container: Some(ctx_path.clone()),
@@ -1476,7 +1593,21 @@ impl DiagramCanvas {
                                 });
                                 ui.close();
                             }
-                        });
+                        }
+                    } else {
+                        if can_create_inside {
+                            ui.menu_button("Create inside...", |ui| {
+                                if let Some(item) = show_create_submenus(ui, "", inside_ctx) {
+                                    action = Some(CanvasAction::PlaceCatalogItem {
+                                        item,
+                                        container: Some(ctx_path.clone()),
+                                        file: file.clone(),
+                                        world_pos: ctx_world,
+                                    });
+                                    ui.close();
+                                }
+                            });
+                        }
 
                         ui.menu_button("Connect / Relate...", |ui| {
                             ui.set_min_width(220.0);
@@ -1693,7 +1824,7 @@ impl DiagramCanvas {
                     .context_world_pos
                     .map(|w| syssur_layout::Point2 { x: w.x, y: w.y });
                 if !q.is_empty() {
-                    if let Some(item) = show_create_submenus(ui, &q) {
+                    if let Some(item) = show_create_submenus(ui, &q, CreateContext::EmptyCanvas) {
                         action = Some(CanvasAction::PlaceCatalogItem {
                             item,
                             container: None,
@@ -1704,7 +1835,9 @@ impl DiagramCanvas {
                     }
                 } else {
                     ui.menu_button("Create SysML v2 Element...", |ui| {
-                        if let Some(item) = show_create_submenus(ui, "") {
+                        if let Some(item) =
+                            show_create_submenus(ui, "", CreateContext::EmptyCanvas)
+                        {
                             action = Some(CanvasAction::PlaceCatalogItem {
                                 item,
                                 container: None,
@@ -1728,9 +1861,10 @@ impl DiagramCanvas {
         });
 
         // HUD overlay
-        let tool_hint = if let Some(ref src_ep) = self.wire_armed_port {
+        let tool_hint = if let Some((ref src_ep, rel_kw)) = self.wire_armed_port {
+            let kind_str = rel_kw.unwrap_or("connect");
             format!(
-                " | Wiring from {}.{}: click target port (Esc to cancel)",
+                " | Wiring ({kind_str}) from {}.{}: click target port (Esc to cancel)",
                 src_ep.node_label, src_ep.port_name
             )
         } else if let Some(ref pick) = self.rel_pick {
@@ -1919,7 +2053,7 @@ impl DiagramCanvas {
         origin: Pos2,
     ) -> Option<PortEndpoint> {
         let hit_radius = (14.0 * zoom).clamp(10.0, 22.0);
-        for node in nodes {
+        for node in nodes.iter().rev() {
             for port in &node.ports {
                 let world_pos = Pos2::new(port.anchor.x, port.anchor.y);
                 let screen_anchor = origin + pan + world_pos.to_vec2() * zoom;
@@ -1941,6 +2075,10 @@ impl DiagramCanvas {
 
     fn paint_wire_draft(&self, painter: &egui::Painter, draft: &WireDraft, origin: Pos2) {
         let start = self.world_to_screen(draft.source.world_pos, origin);
+        let rel_prefix = draft
+            .rel_keyword
+            .map(|kw| format!("[{kw}] "))
+            .unwrap_or_default();
         let (end_world, color, hint) = match &draft.hovered_target {
             Some((target, PortCompatibility::Compatible)) => {
                 let st = draft.source.port_type.as_deref().unwrap_or("Port");
@@ -1948,7 +2086,7 @@ impl DiagramCanvas {
                 (
                     target.world_pos,
                     Color32::from_rgb(85, 220, 130),
-                    format!("Compatible: {st} -> {tt}"),
+                    format!("{rel_prefix}Compatible: {st} -> {tt}"),
                 )
             }
             Some((target, PortCompatibility::DirectionMismatch { source_dir, target_dir })) => (
@@ -2552,7 +2690,7 @@ impl DiagramCanvas {
             || self
                 .wire_armed_port
                 .as_ref()
-                .is_some_and(|ep| ep.node_path.canonical_key() == node_key && ep.port_name == port.name);
+                .is_some_and(|(ep, _)| ep.node_path.canonical_key() == node_key && ep.port_name == port.name);
         painter.rect_filled(box_rect, 2.0, Color32::from_rgb(25, 30, 38));
         painter.rect_stroke(
             box_rect,
@@ -3666,5 +3804,378 @@ mod tests {
             "expected SelectEdge {{ index: 0 }} inside compound container, got {act:?}"
         );
         assert_eq!(canvas.selected_edge, Some(0));
+    }
+
+    #[test]
+    fn palette_hides_attribute_usage() {
+        let ctx = egui::Context::default();
+        let mut search = "attribute".to_string();
+        let mut active_tool = None;
+
+        fn has_text(shape: &egui::epaint::Shape, needle: &str) -> bool {
+            match shape {
+                egui::epaint::Shape::Text(t) => t.galley.text() == needle,
+                egui::epaint::Shape::Vec(v) => v.iter().any(|s| has_text(s, needle)),
+                _ => false,
+            }
+        }
+
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0)));
+        let mut out = ctx.run_ui(raw, |ui| {
+            egui::Panel::left("pal_curated_test").show(ui, |ui| {
+                show_optional_palette(ui, &mut search, &mut active_tool);
+            });
+        });
+        out.textures_delta.clear();
+
+        let rendered_attr = out
+            .shapes
+            .iter()
+            .any(|p| has_text(&p.shape, "Attribute Usage"));
+        assert!(
+            !rendered_attr,
+            "Attribute Usage must be hidden from Diagram Palette"
+        );
+    }
+
+    #[test]
+    fn relationship_tool_clicks_connect_two_ports() {
+        let ctx = egui::Context::default();
+        let (mut layout, meta) = test_layout();
+        layout
+            .nodes
+            .get_mut("Pkg::BlockA")
+            .unwrap()
+            .ports
+            .push(PositionedPort {
+                name: "pwrOut".into(),
+                direction: PortDirection::Out,
+                is_conjugated: false,
+                type_label: Some("PowerPort".into()),
+                side: PortSide::Right,
+                offset: 0.5,
+                anchor: Point2 { x: 280.0, y: 140.0 },
+                normal: Point2 { x: 1.0, y: 0.0 },
+            });
+        layout
+            .nodes
+            .get_mut("Pkg::BlockB")
+            .unwrap()
+            .ports
+            .push(PositionedPort {
+                name: "pwrIn".into(),
+                direction: PortDirection::In,
+                is_conjugated: false,
+                type_label: Some("PowerPort".into()),
+                side: PortSide::Left,
+                offset: 0.5,
+                anchor: Point2 { x: 360.0, y: 140.0 },
+                normal: Point2 { x: -1.0, y: 0.0 },
+            });
+
+        let mut canvas = DiagramCanvas::default();
+        canvas.pan = Vec2::ZERO;
+        canvas.zoom = 1.0;
+        canvas.rebuild_spatial_index(&layout);
+
+        let conn_tool = SYSML_V2_CATALOG
+            .iter()
+            .find(|i| i.id == "rel_connection")
+            .expect("rel_connection tool");
+        let mut tool = Some(conn_tool);
+
+        let (_, rect) = run_canvas_step(&ctx, &mut canvas, &layout, &meta, &mut tool, vec![]);
+        let p_a = rect.min + Vec2::new(280.0, 140.0);
+        let p_b = rect.min + Vec2::new(360.0, 140.0);
+
+        // Click source port on BlockA
+        let _ = run_canvas_step(
+            &ctx,
+            &mut canvas,
+            &layout,
+            &meta,
+            &mut tool,
+            vec![
+                egui::Event::PointerMoved(p_a),
+                egui::Event::PointerButton {
+                    pos: p_a,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let _ = run_canvas_step(
+            &ctx,
+            &mut canvas,
+            &layout,
+            &meta,
+            &mut tool,
+            vec![egui::Event::PointerButton {
+                pos: p_a,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            canvas.wire_armed_port.is_some(),
+            "first click on port with relationship tool should arm port wiring"
+        );
+
+        // Click target port on BlockB
+        let _ = run_canvas_step(
+            &ctx,
+            &mut canvas,
+            &layout,
+            &meta,
+            &mut tool,
+            vec![
+                egui::Event::PointerMoved(p_b),
+                egui::Event::PointerButton {
+                    pos: p_b,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let (act, _) = run_canvas_step(
+            &ctx,
+            &mut canvas,
+            &layout,
+            &meta,
+            &mut tool,
+            vec![egui::Event::PointerButton {
+                pos: p_b,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+
+        match act {
+            Some(CanvasAction::ConnectPorts {
+                source,
+                target,
+                rel_keyword,
+            }) => {
+                assert_eq!(source.port_name, "pwrOut");
+                assert_eq!(target.port_name, "pwrIn");
+                assert_eq!(rel_keyword.as_deref(), Some("connection"));
+            }
+            other => panic!("expected ConnectPorts from relationship clicks, got {other:?}"),
+        }
+        assert!(tool.is_none(), "relationship tool disarms after port connect");
+    }
+
+    #[test]
+    fn shift_drag_between_ports_emits_connect_ports() {
+        let ctx = egui::Context::default();
+        let (mut layout, meta) = test_layout();
+        layout
+            .nodes
+            .get_mut("Pkg::BlockA")
+            .unwrap()
+            .ports
+            .push(PositionedPort {
+                name: "pwrOut".into(),
+                direction: PortDirection::Out,
+                is_conjugated: false,
+                type_label: Some("PowerPort".into()),
+                side: PortSide::Right,
+                offset: 0.5,
+                anchor: Point2 { x: 280.0, y: 140.0 },
+                normal: Point2 { x: 1.0, y: 0.0 },
+            });
+        layout
+            .nodes
+            .get_mut("Pkg::BlockB")
+            .unwrap()
+            .ports
+            .push(PositionedPort {
+                name: "pwrIn".into(),
+                direction: PortDirection::In,
+                is_conjugated: false,
+                type_label: Some("PowerPort".into()),
+                side: PortSide::Left,
+                offset: 0.5,
+                anchor: Point2 { x: 360.0, y: 140.0 },
+                normal: Point2 { x: -1.0, y: 0.0 },
+            });
+
+        let mut canvas = DiagramCanvas::default();
+        canvas.pan = Vec2::ZERO;
+        canvas.zoom = 1.0;
+        canvas.rebuild_spatial_index(&layout);
+        let mut tool = None;
+
+        let (_, rect) = run_canvas_step(&ctx, &mut canvas, &layout, &meta, &mut tool, vec![]);
+        let p_a = rect.min + Vec2::new(280.0, 140.0);
+        let p_b = rect.min + Vec2::new(360.0, 140.0);
+
+        let mut run_shift = |events: Vec<egui::Event>, canvas: &mut DiagramCanvas| -> Option<CanvasAction> {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0)));
+            raw.events = events;
+            let mut action = None;
+            let mut palette_search = String::new();
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    action = canvas.show(
+                        ui,
+                        &layout,
+                        &meta,
+                        &["Pkg".to_string()],
+                        ViewKind::General,
+                        LayoutDirection::TopToBottom,
+                        false,
+                        &mut palette_search,
+                        &mut tool,
+                        "test.sysml",
+                        Locale::En,
+                    );
+                });
+            });
+            out.textures_delta.clear();
+            action
+        };
+
+        let _ = run_shift(
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::SHIFT),
+                egui::Event::PointerMoved(p_a),
+                egui::Event::PointerButton {
+                    pos: p_a,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::SHIFT,
+                },
+                egui::Event::PointerMoved(p_a + Vec2::new(10.0, 0.0)),
+            ],
+            &mut canvas,
+        );
+        let _ = run_shift(vec![egui::Event::PointerMoved(p_b)], &mut canvas);
+        let act = run_shift(
+            vec![egui::Event::PointerButton {
+                pos: p_b,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::SHIFT,
+            }],
+            &mut canvas,
+        );
+
+        match act {
+            Some(CanvasAction::ConnectPorts { source, target, .. }) => {
+                assert_eq!(source.port_name, "pwrOut");
+                assert_eq!(target.port_name, "pwrIn");
+            }
+            other => panic!("expected ConnectPorts from Shift+Drag, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relationship_tool_drag_between_ports_emits_connect_ports() {
+        let ctx = egui::Context::default();
+        let (mut layout, meta) = test_layout();
+        layout
+            .nodes
+            .get_mut("Pkg::BlockA")
+            .unwrap()
+            .ports
+            .push(PositionedPort {
+                name: "pwrOut".into(),
+                direction: PortDirection::Out,
+                is_conjugated: false,
+                type_label: Some("PowerPort".into()),
+                side: PortSide::Right,
+                offset: 0.5,
+                anchor: Point2 { x: 280.0, y: 140.0 },
+                normal: Point2 { x: 1.0, y: 0.0 },
+            });
+        layout
+            .nodes
+            .get_mut("Pkg::BlockB")
+            .unwrap()
+            .ports
+            .push(PositionedPort {
+                name: "pwrIn".into(),
+                direction: PortDirection::In,
+                is_conjugated: false,
+                type_label: Some("PowerPort".into()),
+                side: PortSide::Left,
+                offset: 0.5,
+                anchor: Point2 { x: 360.0, y: 140.0 },
+                normal: Point2 { x: -1.0, y: 0.0 },
+            });
+
+        let mut canvas = DiagramCanvas::default();
+        canvas.pan = Vec2::ZERO;
+        canvas.zoom = 1.0;
+        canvas.rebuild_spatial_index(&layout);
+        let flow_tool = SYSML_V2_CATALOG
+            .iter()
+            .find(|i| i.id == "rel_flow")
+            .expect("rel_flow tool");
+        let mut tool = Some(flow_tool);
+
+        let (_, rect) = run_canvas_step(&ctx, &mut canvas, &layout, &meta, &mut tool, vec![]);
+        let p_a = rect.min + Vec2::new(280.0, 140.0);
+        let p_b = rect.min + Vec2::new(360.0, 140.0);
+
+        let _ = run_canvas_step(
+            &ctx,
+            &mut canvas,
+            &layout,
+            &meta,
+            &mut tool,
+            vec![
+                egui::Event::PointerMoved(p_a),
+                egui::Event::PointerButton {
+                    pos: p_a,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerMoved(p_a + Vec2::new(12.0, 0.0)),
+            ],
+        );
+        let _ = run_canvas_step(
+            &ctx,
+            &mut canvas,
+            &layout,
+            &meta,
+            &mut tool,
+            vec![egui::Event::PointerMoved(p_b)],
+        );
+        let (act, _) = run_canvas_step(
+            &ctx,
+            &mut canvas,
+            &layout,
+            &meta,
+            &mut tool,
+            vec![egui::Event::PointerButton {
+                pos: p_b,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+
+        match act {
+            Some(CanvasAction::ConnectPorts {
+                source,
+                target,
+                rel_keyword,
+            }) => {
+                assert_eq!(source.port_name, "pwrOut");
+                assert_eq!(target.port_name, "pwrIn");
+                assert_eq!(rel_keyword.as_deref(), Some("flow"));
+            }
+            other => panic!("expected ConnectPorts from relationship tool drag, got {other:?}"),
+        }
+        assert!(tool.is_none(), "relationship tool disarms after drag connect");
     }
 }

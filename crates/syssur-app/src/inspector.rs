@@ -51,6 +51,7 @@ pub enum SelectedTarget {
         trigger: Option<String>,
         guard: Option<String>,
         effect: Option<String>,
+        span: Option<syssur_model::Span>,
         file: String,
     },
 }
@@ -90,6 +91,10 @@ pub enum InspectorAction {
         node_key: String,
         port_name: String,
         placement: Option<PortPlacement>,
+    },
+    ArmPortWire {
+        node_key: String,
+        port_name: String,
     },
     EditFileText { file: String, text: String },
     FormatFile { file: String },
@@ -267,6 +272,7 @@ fn show_details_tab(
             trigger,
             guard,
             effect,
+            span,
             file,
         } => {
             let key = format!(
@@ -387,9 +393,27 @@ fn show_details_tab(
             }
 
             ui.separator();
-            if ui.button(tr(locale, TextKey::OpenInCode)).clicked() {
-                action = Some(InspectorAction::JumpToCode(file.clone()));
-            }
+            ui.horizontal(|ui| {
+                if ui.button(tr(locale, TextKey::OpenInCode)).clicked() {
+                    action = Some(InspectorAction::JumpToCode(file.clone()));
+                }
+                if let Some(sp) = span {
+                    if ui
+                        .button(
+                            RichText::new("Delete Connector")
+                                .color(Color32::from_rgb(245, 115, 115)),
+                        )
+                        .clicked()
+                    {
+                        action = Some(InspectorAction::ApplyCommand(SyssurCommand::DeleteSpan {
+                            file: file.clone(),
+                            start: sp.start,
+                            end: sp.end,
+                            label: format!("{disp_name} {source} -> {target}"),
+                        }));
+                    }
+                }
+            });
         }
         SelectedTarget::Port {
             node_key,
@@ -497,14 +521,22 @@ fn show_details_tab(
             });
 
             ui.add_space(4.0);
-            if ui.button("Toggle Conjugation (~)").clicked() {
-                action = Some(InspectorAction::ApplyCommand(
-                    SyssurCommand::TogglePortConjugation {
-                        file: file.clone(),
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Wire / Connect from Port...").clicked() {
+                    action = Some(InspectorAction::ArmPortWire {
+                        node_key: node_key.clone(),
                         port_name: port_name.clone(),
-                    },
-                ));
-            }
+                    });
+                }
+                if ui.button("Toggle Conjugation (~)").clicked() {
+                    action = Some(InspectorAction::ApplyCommand(
+                        SyssurCommand::TogglePortConjugation {
+                            file: file.clone(),
+                            port_name: port_name.clone(),
+                        },
+                    ));
+                }
+            });
 
             ui.add_space(4.0);
             ui.label(RichText::new("Border Position:").weak().small());

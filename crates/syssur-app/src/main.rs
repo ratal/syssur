@@ -12,7 +12,7 @@ mod inspector;
 mod io;
 
 use canvas::{CanvasAction, DiagramCanvas, NodeMeta, PortEndpoint};
-use catalog::{paint_kind_icon, show_create_submenus, CatalogCategory, SysmlCatalogItem};
+use catalog::{paint_kind_icon, show_create_submenus, CatalogCategory, CreateContext, SysmlCatalogItem};
 use egui::{Color32, FontFamily, FontId, Id, RichText, ScrollArea, TextEdit, TextStyle, Ui, WidgetText};
 use egui_dock::{DockArea, DockState, Style, TabViewer};
 use ewebsock::{WsEvent, WsMessage, WsReceiver, WsSender};
@@ -751,8 +751,26 @@ impl SyssurApp {
         }
     }
 
-    fn connect_ports(&mut self, source: PortEndpoint, target: PortEndpoint) {
-        let owner_id = source
+    fn resolve_container_owner(&self, id: &ElementId) -> Option<(String, String)> {
+        if let Some(pd) = self.graph.resolve_part_def(id) {
+            return Some((pd.name.clone(), pd.span.file.clone()));
+        }
+        if let Some(pu) = self.graph.top_level_parts.get(id) {
+            return Some((pu.name.clone(), pu.span.file.clone()));
+        }
+        if let Some(pkg) = self.graph.packages.get(id) {
+            return Some((pkg.name.clone(), pkg.span.file.clone()));
+        }
+        None
+    }
+
+    fn connect_ports(
+        &mut self,
+        source: PortEndpoint,
+        target: PortEndpoint,
+        rel_keyword: Option<String>,
+    ) {
+        let common_parent = source
             .node_path
             .parent()
             .and_then(|p| {
@@ -761,36 +779,119 @@ impl SyssurApp {
                     .parent()
                     .filter(|tp| *tp == p)
                     .and_then(|_| p.leaf().cloned())
-            })
-            .unwrap_or_else(|| self.active_root.clone());
+            });
 
-        let (owner_def, file) = self
-            .graph
-            .resolve_part_def(&owner_id)
-            .map(|pd| (pd.name.clone(), pd.span.file.clone()))
-            .unwrap_or_else(|| (owner_id.short_name().to_string(), self.active_file.clone()));
+        let fallback_file = source
+            .node_path
+            .leaf()
+            .map(|id| self.file_for_element(id))
+            .unwrap_or_else(|| self.active_file.clone());
+
+        let (owner_def, file) = common_parent
+            .as_ref()
+            .and_then(|id| self.resolve_container_owner(id))
+            .or_else(|| {
+                (!self.graph.views.contains_key(&self.active_root))
+                    .then(|| self.resolve_container_owner(&self.active_root))
+                    .flatten()
+            })
+            .or_else(|| {
+                source
+                    .node_path
+                    .0
+                    .first()
+                    .and_then(|id| id.as_str().split("::").next())
+                    .and_then(|pkg| {
+                        self.graph
+                            .packages
+                            .values()
+                            .find(|p| p.name == pkg)
+                            .map(|p| (p.name.clone(), p.span.file.clone()))
+                    })
+            })
+            .unwrap_or_else(|| self.target_package_for_active_view(&fallback_file));
 
         let src_ref = format!("{}.{}", source.node_label, source.port_name);
         let dst_ref = format!("{}.{}", target.node_label, target.port_name);
 
-        let cmd = match self.wire_mode {
-            WireMode::Connect => SyssurCommand::CreateConnection {
+        let first_iface_def = || {
+            self.graph
+                .generic_elements
+                .values()
+                .find(|g| g.kind == SysmlElementKind::Interface && g.is_def)
+                .map(|g| g.name.clone())
+        };
+
+        let cmd = match rel_keyword.as_deref() {
+            Some("connection") => SyssurCommand::CreateConnection {
                 file,
                 owner_def,
                 source: src_ref,
                 target: dst_ref,
             },
-            WireMode::Interface => {
+            Some("interface") => {
                 let idx = self.history.entries().len() + 1;
-                SyssurCommand::CreateInterface {
-                    file,
-                    owner_def,
-                    name: format!("link{idx}"),
-                    interface_def: "PowerInterface".to_string(),
-                    source: src_ref,
-                    target: dst_ref,
+                if let Some(iface_def) = first_iface_def() {
+                    SyssurCommand::CreateInterface {
+                        file,
+                        owner_def,
+                        name: format!("link{idx}"),
+                        interface_def: iface_def,
+                        source: src_ref,
+                        target: dst_ref,
+                    }
+                } else {
+                    SyssurCommand::CreateRelationship {
+                        file,
+                        owner_scope: owner_def,
+                        kind: "interface".to_string(),
+                        source: src_ref,
+                        target: dst_ref,
+                        label: Some(format!("link{idx}")),
+                        guard: None,
+                    }
                 }
             }
+            Some(kw) => SyssurCommand::CreateRelationship {
+                file,
+                owner_scope: owner_def,
+                kind: kw.to_string(),
+                source: src_ref,
+                target: dst_ref,
+                label: None,
+                guard: None,
+            },
+            None => match self.wire_mode {
+                WireMode::Connect => SyssurCommand::CreateConnection {
+                    file,
+                    owner_def,
+                    source: src_ref,
+                    target: dst_ref,
+                },
+                WireMode::Interface => {
+                    let idx = self.history.entries().len() + 1;
+                    if let Some(iface_def) = first_iface_def() {
+                        SyssurCommand::CreateInterface {
+                            file,
+                            owner_def,
+                            name: format!("link{idx}"),
+                            interface_def: iface_def,
+                            source: src_ref,
+                            target: dst_ref,
+                        }
+                    } else {
+                        SyssurCommand::CreateRelationship {
+                            file,
+                            owner_scope: owner_def,
+                            kind: "interface".to_string(),
+                            source: src_ref,
+                            target: dst_ref,
+                            label: Some(format!("link{idx}")),
+                            guard: None,
+                        }
+                    }
+                }
+            },
         };
         self.execute_command(cmd);
     }
@@ -1122,8 +1223,12 @@ impl SyssurApp {
 
     fn handle_canvas_action(&mut self, tab_id: usize, action: CanvasAction, ctx: &egui::Context) {
         match action {
-            CanvasAction::ConnectPorts { source, target } => {
-                self.connect_ports(source, target);
+            CanvasAction::ConnectPorts {
+                source,
+                target,
+                rel_keyword,
+            } => {
+                self.connect_ports(source, target, rel_keyword);
             }
             CanvasAction::IncompatibleWireDrop { reason } => {
                 self.status_line = format!("Blocked wire: {reason}");
@@ -1357,136 +1462,14 @@ impl SyssurApp {
                 };
             }
             CanvasAction::SelectEdge { index } => {
-                if let Some(tab) = self.view_tabs.get(&tab_id) {
-                    if let Some(edge) = tab.layout.edges.get(index) {
-                        self.inspector_tab = InspectorTab::Details;
-                        if let Some(conn) = self
-                            .graph
-                            .connections
-                            .iter()
-                            .enumerate()
-                            .find(|(i, c)| format!("{}#{i}", c.id) == edge.id)
-                            .map(|(_, c)| c)
-                        {
-                            let (_, sp) = split_port_ref(&conn.source_path);
-                            let (_, tp) = split_port_ref(&conn.target_path);
-                            self.selected_target = SelectedTarget::Edge {
-                                name: conn.name.clone(),
-                                source: conn.source_path.clone(),
-                                target: conn.target_path.clone(),
-                                source_port: sp.map(str::to_string),
-                                target_port: tp.map(str::to_string),
-                                kind: conn.kind,
-                                type_name: conn
-                                    .interface_def
-                                    .as_ref()
-                                    .map(|d| d.short_name().to_string()),
-                                owner_scope: Some(conn.owner_scope.as_str().to_string()),
-                                trigger: None,
-                                guard: edge.guard.clone(),
-                                effect: None,
-                                file: conn.span.file.clone(),
-                            };
-                        } else if let Some(succ) = self
-                            .graph
-                            .successions
-                            .iter()
-                            .enumerate()
-                            .find(|(i, s)| format!("{}#{i}", s.id) == edge.id)
-                            .map(|(_, s)| s)
-                        {
-                            self.selected_target = SelectedTarget::Edge {
-                                name: None,
-                                source: succ.source.clone(),
-                                target: succ.target.clone(),
-                                source_port: None,
-                                target_port: None,
-                                kind: RelationshipKind::Succession,
-                                type_name: None,
-                                owner_scope: Some(succ.owner_scope.as_str().to_string()),
-                                trigger: None,
-                                guard: succ.guard.clone(),
-                                effect: None,
-                                file: succ.span.file.clone(),
-                            };
-                        } else if let Some(tr) = self
-                            .graph
-                            .transitions
-                            .iter()
-                            .enumerate()
-                            .find(|(i, t)| format!("{}#{i}", t.id) == edge.id)
-                            .map(|(_, t)| t)
-                        {
-                            self.selected_target = SelectedTarget::Edge {
-                                name: None,
-                                source: tr.source.clone(),
-                                target: tr.target.clone(),
-                                source_port: None,
-                                target_port: None,
-                                kind: RelationshipKind::Transition,
-                                type_name: None,
-                                owner_scope: Some(tr.owner_scope.as_str().to_string()),
-                                trigger: tr.trigger.clone(),
-                                guard: tr.guard.clone(),
-                                effect: tr.effect.clone(),
-                                file: tr.span.file.clone(),
-                            };
-                        } else if let Some(link) = self
-                            .graph
-                            .trace_links
-                            .iter()
-                            .enumerate()
-                            .find(|(i, _)| format!("trace#{i}") == edge.id)
-                            .map(|(_, l)| l)
-                        {
-                            self.selected_target = SelectedTarget::Edge {
-                                name: None,
-                                source: link.target.clone(),
-                                target: link.requirement.as_str().to_string(),
-                                source_port: None,
-                                target_port: None,
-                                kind: link.kind,
-                                type_name: None,
-                                owner_scope: None,
-                                trigger: None,
-                                guard: None,
-                                effect: None,
-                                file: link.span.file.clone(),
-                            };
-                        } else if let Some(spec) =
-                            tab.base_input.edges.iter().find(|e| e.id == edge.id)
-                        {
-                            self.selected_target = SelectedTarget::Edge {
-                                name: spec.label.clone(),
-                                source: spec.source_node.to_string(),
-                                target: spec.target_node.to_string(),
-                                source_port: spec.source_port.clone(),
-                                target_port: spec.target_port.clone(),
-                                kind: spec.kind,
-                                type_name: None,
-                                owner_scope: None,
-                                trigger: None,
-                                guard: spec.guard.clone(),
-                                effect: None,
-                                file: spec.span.file.clone(),
-                            };
-                        } else {
-                            self.selected_target = SelectedTarget::Edge {
-                                name: edge.label.clone(),
-                                source: edge.id.clone(),
-                                target: edge.label.clone().unwrap_or_default(),
-                                source_port: None,
-                                target_port: None,
-                                kind: edge.kind,
-                                type_name: None,
-                                owner_scope: None,
-                                trigger: None,
-                                guard: edge.guard.clone(),
-                                effect: None,
-                                file: self.active_file.clone(),
-                            };
-                        }
-                    }
+                if let Some(target) = self.resolve_edge_target(tab_id, index) {
+                    self.inspector_tab = InspectorTab::Details;
+                    self.selected_target = target;
+                }
+            }
+            CanvasAction::DeleteEdge { index } => {
+                if let Some(target) = self.resolve_edge_target(tab_id, index) {
+                    self.delete_edge_target(&target);
                 }
             }
             CanvasAction::InspectAsRoot { target } => {
@@ -1664,7 +1647,178 @@ impl SyssurApp {
         });
     }
 
+    fn resolve_edge_target(&self, tab_id: usize, index: usize) -> Option<SelectedTarget> {
+        let tab = self.view_tabs.get(&tab_id)?;
+        let edge = tab.layout.edges.get(index)?;
+        if let Some(conn) = self
+            .graph
+            .connections
+            .iter()
+            .enumerate()
+            .find(|(i, c)| format!("{}#{i}", c.id) == edge.id)
+            .map(|(_, c)| c)
+        {
+            let (_, sp) = split_port_ref(&conn.source_path);
+            let (_, tp) = split_port_ref(&conn.target_path);
+            Some(SelectedTarget::Edge {
+                name: conn.name.clone(),
+                source: conn.source_path.clone(),
+                target: conn.target_path.clone(),
+                source_port: sp.map(str::to_string),
+                target_port: tp.map(str::to_string),
+                kind: conn.kind,
+                type_name: conn
+                    .interface_def
+                    .as_ref()
+                    .map(|d| d.short_name().to_string()),
+                owner_scope: Some(conn.owner_scope.as_str().to_string()),
+                trigger: None,
+                guard: edge.guard.clone(),
+                effect: None,
+                span: (conn.span.start < conn.span.end).then(|| conn.span.clone()),
+                file: conn.span.file.clone(),
+            })
+        } else if let Some(succ) = self
+            .graph
+            .successions
+            .iter()
+            .enumerate()
+            .find(|(i, s)| format!("{}#{i}", s.id) == edge.id)
+            .map(|(_, s)| s)
+        {
+            Some(SelectedTarget::Edge {
+                name: None,
+                source: succ.source.clone(),
+                target: succ.target.clone(),
+                source_port: None,
+                target_port: None,
+                kind: RelationshipKind::Succession,
+                type_name: None,
+                owner_scope: Some(succ.owner_scope.as_str().to_string()),
+                trigger: None,
+                guard: succ.guard.clone(),
+                effect: None,
+                span: (succ.span.start < succ.span.end).then(|| succ.span.clone()),
+                file: succ.span.file.clone(),
+            })
+        } else if let Some(tr) = self
+            .graph
+            .transitions
+            .iter()
+            .enumerate()
+            .find(|(i, t)| format!("{}#{i}", t.id) == edge.id)
+            .map(|(_, t)| t)
+        {
+            Some(SelectedTarget::Edge {
+                name: None,
+                source: tr.source.clone(),
+                target: tr.target.clone(),
+                source_port: None,
+                target_port: None,
+                kind: RelationshipKind::Transition,
+                type_name: None,
+                owner_scope: Some(tr.owner_scope.as_str().to_string()),
+                trigger: tr.trigger.clone(),
+                guard: tr.guard.clone(),
+                effect: tr.effect.clone(),
+                span: (tr.span.start < tr.span.end).then(|| tr.span.clone()),
+                file: tr.span.file.clone(),
+            })
+        } else if let Some(link) = self
+            .graph
+            .trace_links
+            .iter()
+            .enumerate()
+            .find(|(i, _)| format!("trace#{i}") == edge.id)
+            .map(|(_, l)| l)
+        {
+            Some(SelectedTarget::Edge {
+                name: None,
+                source: link.target.clone(),
+                target: link.requirement.as_str().to_string(),
+                source_port: None,
+                target_port: None,
+                kind: link.kind,
+                type_name: None,
+                owner_scope: None,
+                trigger: None,
+                guard: None,
+                effect: None,
+                span: (link.span.start < link.span.end).then(|| link.span.clone()),
+                file: link.span.file.clone(),
+            })
+        } else if let Some(spec) = tab.base_input.edges.iter().find(|e| e.id == edge.id) {
+            Some(SelectedTarget::Edge {
+                name: spec.label.clone(),
+                source: spec.source_node.to_string(),
+                target: spec.target_node.to_string(),
+                source_port: spec.source_port.clone(),
+                target_port: spec.target_port.clone(),
+                kind: spec.kind,
+                type_name: None,
+                owner_scope: None,
+                trigger: None,
+                guard: spec.guard.clone(),
+                effect: None,
+                span: (spec.span.start < spec.span.end).then(|| spec.span.clone()),
+                file: spec.span.file.clone(),
+            })
+        } else {
+            Some(SelectedTarget::Edge {
+                name: edge.label.clone(),
+                source: edge.id.clone(),
+                target: edge.label.clone().unwrap_or_default(),
+                source_port: None,
+                target_port: None,
+                kind: edge.kind,
+                type_name: None,
+                owner_scope: None,
+                trigger: None,
+                guard: edge.guard.clone(),
+                effect: None,
+                span: None,
+                file: self.active_file.clone(),
+            })
+        }
+    }
+
+    fn clear_edge_selection(&mut self) {
+        self.selected_target = SelectedTarget::None;
+        for tab in self.view_tabs.values_mut() {
+            tab.canvas.selected_edge = None;
+        }
+    }
+
+    fn delete_edge_target(&mut self, target: &SelectedTarget) {
+        if let SelectedTarget::Edge {
+            kind,
+            source,
+            target: dst,
+            span,
+            file,
+            ..
+        } = target
+        {
+            if let Some(sp) = span {
+                self.execute_command(SyssurCommand::DeleteSpan {
+                    file: file.clone(),
+                    start: sp.start,
+                    end: sp.end,
+                    label: format!("{kind:?} {source} -> {dst}"),
+                });
+                self.clear_edge_selection();
+            } else {
+                self.status_line = "Cannot delete inferred connector without source span".into();
+            }
+        }
+    }
+
     fn delete_selected(&mut self) {
+        if matches!(&self.selected_target, SelectedTarget::Edge { .. }) {
+            let target = self.selected_target.clone();
+            self.delete_edge_target(&target);
+            return;
+        }
         if let SelectedTarget::Port {
             port_name, file, ..
         } = &self.selected_target
@@ -2227,7 +2381,26 @@ impl SyssurApp {
                     locale,
                 ) {
                     match act {
-                        InspectorAction::ApplyCommand(cmd) => self.execute_command(cmd),
+                        InspectorAction::ApplyCommand(cmd) => {
+                            let clears_edge = matches!(cmd, SyssurCommand::DeleteSpan { .. });
+                            self.execute_command(cmd);
+                            if clears_edge {
+                                self.clear_edge_selection();
+                            }
+                        }
+                        InspectorAction::ArmPortWire {
+                            node_key,
+                            port_name,
+                        } => {
+                            if let Some(tab) = self
+                                .active_view_tab
+                                .and_then(|tid| self.view_tabs.get_mut(&tid))
+                            {
+                                tab.canvas
+                                    .arm_port_wire(&tab.layout, &node_key, &port_name);
+                                self.status_line = format!("Click target port to wire from {port_name}");
+                            }
+                        }
                         InspectorAction::MovePort {
                             node_key,
                             port_name,
@@ -2938,13 +3111,13 @@ fn render_explorer_package(
         ui.separator();
 
         if !q.is_empty() {
-            if let Some(item) = show_create_submenus(ui, &q) {
+            if let Some(item) = show_create_submenus(ui, &q, CreateContext::PackageExplorer) {
                 *pending_catalog = Some((item, Some(pkg.name.clone()), pkg.span.file.clone()));
                 ui.close();
             }
         } else {
             ui.menu_button("Create in Package...", |ui| {
-                if let Some(item) = show_create_submenus(ui, "") {
+                if let Some(item) = show_create_submenus(ui, "", CreateContext::PackageExplorer) {
                     *pending_catalog = Some((item, Some(pkg.name.clone()), pkg.span.file.clone()));
                     ui.close();
                 }
@@ -4874,5 +5047,82 @@ mod tests {
 
         app.handle_canvas_action(tab_id, CanvasAction::AutoLayout, &ctx);
         assert!(app.view_tabs[&tab_id].node_size_overrides.is_empty());
+    }
+
+    #[test]
+    fn deleting_selected_edge_removes_connection_from_model() {
+        let mut app = SyssurApp::default();
+        let initial_conns = app.graph.connections.len();
+        assert!(initial_conns > 0, "default Rover preset has connections");
+
+        let (tab_id, edge_idx) = app
+            .view_tabs
+            .iter()
+            .find_map(|(&tid, tab)| {
+                tab.layout
+                    .edges
+                    .iter()
+                    .enumerate()
+                    .find(|(_, e)| !e.id.starts_with("spec#"))
+                    .map(|(i, _)| (tid, i))
+            })
+            .expect("routed non-spec connection edge");
+
+        let ctx = egui::Context::default();
+        app.handle_canvas_action(tab_id, CanvasAction::SelectEdge { index: edge_idx }, &ctx);
+        assert!(
+            matches!(
+                &app.selected_target,
+                SelectedTarget::Edge { span: Some(_), .. }
+            ),
+            "selected edge should carry source span for deletion"
+        );
+
+        app.delete_selected();
+        assert_eq!(
+            app.graph.connections.len(),
+            initial_conns - 1,
+            "deleting selected edge must remove one connection from model"
+        );
+        assert!(matches!(app.selected_target, SelectedTarget::None));
+    }
+
+    #[test]
+    fn connecting_ports_creates_connection_in_model() {
+        let mut app = SyssurApp::default();
+        let initial_conns = app.graph.connections.len();
+
+        let (src_ep, dst_ep) = app
+            .view_tabs
+            .values()
+            .find_map(|tab| {
+                let mut endpoints: Vec<PortEndpoint> = Vec::new();
+                for node in tab.layout.nodes.values() {
+                    if let Some(p) = node.ports.first() {
+                        endpoints.push(PortEndpoint {
+                            node_path: node.path.clone(),
+                            node_label: node.label.clone(),
+                            port_name: p.name.clone(),
+                            port_type: p.type_label.clone(),
+                            direction: p.direction,
+                            is_conjugated: p.is_conjugated,
+                            world_pos: egui::Pos2::new(p.anchor.x, p.anchor.y),
+                        });
+                    }
+                }
+                if endpoints.len() >= 2 {
+                    Some((endpoints[0].clone(), endpoints[1].clone()))
+                } else {
+                    None
+                }
+            })
+            .expect("at least two ported nodes in Rover preset");
+
+        app.connect_ports(src_ep, dst_ep, Some("connection".to_string()));
+        assert_eq!(
+            app.graph.connections.len(),
+            initial_conns + 1,
+            "connecting two ports must add a connection to the parsed model"
+        );
     }
 }

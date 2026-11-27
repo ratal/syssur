@@ -5,6 +5,19 @@
 //! menus, and the optional toggleable palette drawer.
 
 use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextEdit, Ui, Vec2};
+use syssur_layout::NodeShape;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateContext {
+    /// Diagram Palette drawer (standalone graphical shapes + connectors/relationships).
+    DiagramPalette,
+    /// Right-click on empty diagram canvas (standalone graphical shapes only).
+    EmptyCanvas,
+    /// Right-click "Create inside..." on a specific diagram node shape.
+    InsideNode(NodeShape),
+    /// Right-click "Create in Package..." in the Model Explorer (full package-level elements).
+    PackageExplorer,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CatalogCategory {
@@ -924,6 +937,126 @@ pub fn catalog_relationships() -> impl Iterator<Item = &'static SysmlCatalogItem
     SYSML_V2_CATALOG.iter().filter(|item| item.is_relationship)
 }
 
+/// Returns whether a catalog item should be shown in the given UI creation context.
+pub fn is_allowed_in_context(item: &SysmlCatalogItem, ctx: CreateContext) -> bool {
+    if item.is_relationship {
+        return matches!(ctx, CreateContext::DiagramPalette);
+    }
+
+    match ctx {
+        CreateContext::PackageExplorer => true,
+        CreateContext::DiagramPalette | CreateContext::EmptyCanvas => matches!(
+            item.id,
+            "pkg"
+                | "comment"
+                | "part_def"
+                | "part"
+                | "item_def"
+                | "item"
+                | "occ_def"
+                | "occ"
+                | "enum_def"
+                | "port_def"
+                | "iface_def"
+                | "conn_def"
+                | "alloc_def"
+                | "flow_def"
+                | "action_def"
+                | "action"
+                | "start"
+                | "done"
+                | "fork"
+                | "join"
+                | "decide"
+                | "merge"
+                | "accept"
+                | "send"
+                | "assign"
+                | "terminate"
+                | "if_node"
+                | "while_node"
+                | "for_node"
+                | "state_def"
+                | "state"
+                | "calc_def"
+                | "calc"
+                | "constraint_def"
+                | "constraint"
+                | "req_def"
+                | "req"
+                | "concern_def"
+                | "concern"
+                | "case_def"
+                | "use_case_def"
+                | "use_case"
+                | "analysis_def"
+                | "verif_def"
+        ),
+        CreateContext::InsideNode(shape) => match shape {
+            NodeShape::PartBlock => matches!(
+                item.id,
+                "attr"
+                    | "port"
+                    | "conj_port"
+                    | "part"
+                    | "item"
+                    | "ref"
+                    | "perform_action"
+                    | "exhibit_state"
+                    | "assert_constraint"
+                    | "constraint"
+                    | "calc"
+                    | "req"
+                    | "comment"
+            ),
+            NodeShape::ActionBox => matches!(
+                item.id,
+                "action"
+                    | "start"
+                    | "done"
+                    | "fork"
+                    | "join"
+                    | "decide"
+                    | "merge"
+                    | "accept"
+                    | "send"
+                    | "assign"
+                    | "terminate"
+                    | "if_node"
+                    | "while_node"
+                    | "for_node"
+                    | "attr"
+                    | "comment"
+            ),
+            NodeShape::StateBox => matches!(item.id, "state" | "attr" | "comment"),
+            NodeShape::RequirementCard => matches!(
+                item.id,
+                "req" | "constraint" | "assert_constraint" | "subject" | "stakeholder" | "attr" | "comment"
+            ),
+            NodeShape::ConstraintCard => matches!(item.id, "attr" | "constraint" | "comment"),
+            NodeShape::CaseOval => matches!(
+                item.id,
+                "subject" | "actor" | "stakeholder" | "include_uc" | "use_case" | "action" | "req" | "comment"
+            ),
+            NodeShape::StartCircle
+            | NodeShape::DoneBullseye
+            | NodeShape::ForkJoinBar
+            | NodeShape::DecideDiamond
+            | NodeShape::MergeDiamond => false,
+            NodeShape::GenericElement => {
+                matches!(item.id, "attr" | "port" | "conj_port" | "part" | "item" | "comment")
+            }
+        },
+    }
+}
+
+/// Returns true if at least one catalog item is allowed in `ctx`.
+pub fn has_items_for_context(ctx: CreateContext) -> bool {
+    SYSML_V2_CATALOG
+        .iter()
+        .any(|item| is_allowed_in_context(item, ctx))
+}
+
 fn category_accent(cat: CatalogCategory, keyword: &str) -> Color32 {
     match cat {
         CatalogCategory::NamespacesAndAnnotations => Color32::from_rgb(160, 175, 200),
@@ -1179,13 +1312,21 @@ pub fn catalog_item_row(
     resp.on_hover_text(item.doc_hint)
 }
 
-/// Renders clean, non-convoluted Clause 7 creation submenus (or a flat filtered list when searching).
-pub fn show_create_submenus(ui: &mut Ui, search_query: &str) -> Option<&'static SysmlCatalogItem> {
+/// Renders clean, non-convoluted Clause 7 creation submenus (or a flat filtered list when searching),
+/// curated according to `ctx`.
+pub fn show_create_submenus(
+    ui: &mut Ui,
+    search_query: &str,
+    ctx: CreateContext,
+) -> Option<&'static SysmlCatalogItem> {
     let q = search_query.trim().to_ascii_lowercase();
     let mut picked = None;
 
     if !q.is_empty() {
-        for item in SYSML_V2_CATALOG.iter().filter(|i| !i.is_relationship) {
+        for item in SYSML_V2_CATALOG
+            .iter()
+            .filter(|i| is_allowed_in_context(i, ctx))
+        {
             if item.label.to_ascii_lowercase().contains(&q)
                 || item.keyword.to_ascii_lowercase().contains(&q)
             {
@@ -1198,13 +1339,31 @@ pub fn show_create_submenus(ui: &mut Ui, search_query: &str) -> Option<&'static 
         return picked;
     }
 
+    if matches!(ctx, CreateContext::InsideNode(_)) {
+        ui.set_min_width(220.0);
+        for item in SYSML_V2_CATALOG
+            .iter()
+            .filter(|i| is_allowed_in_context(i, ctx))
+        {
+            if catalog_item_row(ui, item, false, false).clicked() {
+                picked = Some(item);
+                ui.close();
+            }
+        }
+        return picked;
+    }
+
     for cat in CatalogCategory::ALL_CREATE {
+        let items: Vec<&'static SysmlCatalogItem> = SYSML_V2_CATALOG
+            .iter()
+            .filter(|i| i.category == cat && is_allowed_in_context(i, ctx))
+            .collect();
+        if items.is_empty() {
+            continue;
+        }
         ui.menu_button(cat.label(), |ui| {
             ui.set_min_width(220.0);
-            for item in SYSML_V2_CATALOG
-                .iter()
-                .filter(|i| !i.is_relationship && i.category == cat)
-            {
+            for item in items {
                 if catalog_item_row(ui, item, false, false).clicked() {
                     picked = Some(item);
                     ui.close();
@@ -1246,7 +1405,9 @@ pub fn show_optional_palette(
                 {
                     let items: Vec<&'static SysmlCatalogItem> = SYSML_V2_CATALOG
                         .iter()
-                        .filter(|i| i.category == cat)
+                        .filter(|i| {
+                            i.category == cat && is_allowed_in_context(i, CreateContext::DiagramPalette)
+                        })
                         .filter(|i| {
                             q.is_empty()
                                 || i.label.to_ascii_lowercase().contains(&q)
@@ -1269,4 +1430,96 @@ pub fn show_optional_palette(
                 }
             });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn find_item(id: &str) -> &'static SysmlCatalogItem {
+        SYSML_V2_CATALOG
+            .iter()
+            .find(|i| i.id == id)
+            .unwrap_or_else(|| panic!("missing catalog item {id}"))
+    }
+
+    #[test]
+    fn attribute_usage_excluded_from_palette_and_canvas_allowed_inside_part() {
+        let attr = find_item("attr");
+        assert!(!is_allowed_in_context(attr, CreateContext::DiagramPalette));
+        assert!(!is_allowed_in_context(attr, CreateContext::EmptyCanvas));
+        assert!(is_allowed_in_context(
+            attr,
+            CreateContext::InsideNode(NodeShape::PartBlock)
+        ));
+        assert!(is_allowed_in_context(attr, CreateContext::PackageExplorer));
+    }
+
+    #[test]
+    fn port_usages_excluded_from_palette_and_canvas_allowed_inside_part() {
+        for id in ["port", "conj_port"] {
+            let item = find_item(id);
+            assert!(!is_allowed_in_context(item, CreateContext::DiagramPalette));
+            assert!(!is_allowed_in_context(item, CreateContext::EmptyCanvas));
+            assert!(is_allowed_in_context(
+                item,
+                CreateContext::InsideNode(NodeShape::PartBlock)
+            ));
+        }
+    }
+
+    #[test]
+    fn control_nodes_have_no_create_inside_items() {
+        for shape in [
+            NodeShape::StartCircle,
+            NodeShape::DoneBullseye,
+            NodeShape::ForkJoinBar,
+            NodeShape::DecideDiamond,
+            NodeShape::MergeDiamond,
+        ] {
+            assert!(!has_items_for_context(CreateContext::InsideNode(shape)));
+        }
+    }
+
+    #[test]
+    fn relationships_only_in_palette_not_empty_canvas_or_explorer() {
+        for rel in catalog_relationships() {
+            assert!(is_allowed_in_context(rel, CreateContext::DiagramPalette));
+            assert!(!is_allowed_in_context(rel, CreateContext::EmptyCanvas));
+            assert!(!is_allowed_in_context(rel, CreateContext::PackageExplorer));
+            assert!(!is_allowed_in_context(
+                rel,
+                CreateContext::InsideNode(NodeShape::PartBlock)
+            ));
+        }
+    }
+
+    #[test]
+    fn non_graphical_declarations_only_in_package_explorer() {
+        for id in [
+            "lib_pkg",
+            "import",
+            "alias",
+            "filter",
+            "attr_def",
+            "general_view",
+            "viewpoint_def",
+            "rendering_def",
+            "metadata_def",
+        ] {
+            let item = find_item(id);
+            assert!(
+                !is_allowed_in_context(item, CreateContext::DiagramPalette),
+                "{id} must not appear in palette"
+            );
+            assert!(
+                !is_allowed_in_context(item, CreateContext::EmptyCanvas),
+                "{id} must not appear on empty canvas"
+            );
+            assert!(
+                is_allowed_in_context(item, CreateContext::PackageExplorer),
+                "{id} must remain available in Model Explorer"
+            );
+        }
+    }
 }
