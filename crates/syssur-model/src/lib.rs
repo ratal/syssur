@@ -643,9 +643,11 @@ impl DefinitionGraph {
         }
         for local in &def.ports {
             let mut resolved = local.clone();
-            if let Some(ref pd_id) = resolved.port_def {
-                if let Some(pd) = self.resolve_port_def(pd_id) {
-                    resolved.direction = pd.direction.effective_direction(resolved.is_conjugated);
+            if resolved.direction == PortDirection::InOut {
+                if let Some(ref pd_id) = resolved.port_def {
+                    if let Some(pd) = self.resolve_port_def(pd_id) {
+                        resolved.direction = pd.direction.effective_direction(resolved.is_conjugated);
+                    }
                 }
             }
             by_name.insert(resolved.name.clone(), resolved);
@@ -660,19 +662,20 @@ impl DefinitionGraph {
         let src_type = src.port_def.as_ref().map(|id| id.short_name());
         let dst_type = dst.port_def.as_ref().map(|id| id.short_name());
 
-        let src_dir = src
-            .port_def
-            .as_ref()
-            .and_then(|id| self.resolve_port_def(id))
-            .map(|pd| pd.direction.effective_direction(src.is_conjugated))
-            .unwrap_or_else(|| src.direction.effective_direction(src.is_conjugated));
+        let resolve_dir = |p: &PortUsage| -> PortDirection {
+            if p.direction != PortDirection::InOut {
+                p.direction
+            } else {
+                p.port_def
+                    .as_ref()
+                    .and_then(|id| self.resolve_port_def(id))
+                    .map(|pd| pd.direction.effective_direction(p.is_conjugated))
+                    .unwrap_or_else(|| p.direction.effective_direction(p.is_conjugated))
+            }
+        };
 
-        let dst_dir = dst
-            .port_def
-            .as_ref()
-            .and_then(|id| self.resolve_port_def(id))
-            .map(|pd| pd.direction.effective_direction(dst.is_conjugated))
-            .unwrap_or_else(|| dst.direction.effective_direction(dst.is_conjugated));
+        let src_dir = resolve_dir(src);
+        let dst_dir = resolve_dir(dst);
 
         check_port_direction_and_type(src_type, src_dir, dst_type, dst_dir)
     }

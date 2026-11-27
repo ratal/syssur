@@ -3998,13 +3998,20 @@ fn populate_filtered_structural_nodes(
         .collect();
     let instantiated_types = collect_instantiated_part_defs(graph);
 
+    let max_depth = if view_kind == ViewKind::Interconnection {
+        4
+    } else {
+        2
+    };
+    let expand_matched_descendants = view_kind == ViewKind::Interconnection;
+
     let before_count = input.nodes.len();
     let mut shown_part_defs = 0usize;
     for root in &part_def_roots {
         if shown_part_defs >= max_part_defs {
             break;
         }
-        if let Some(tree) = InstanceNode::expand_from_graph(graph, root, 2) {
+        if let Some(tree) = InstanceNode::expand_from_graph(graph, root, max_depth) {
             if !tree.children.is_empty()
                 || !instantiated_types.contains(root)
                 || graph.part_defs.len() <= 6
@@ -4016,6 +4023,7 @@ fn populate_filtered_structural_nodes(
                     None,
                     include_root_parent,
                     Some(filter),
+                    expand_matched_descendants,
                     expanded_keys,
                     input,
                     meta,
@@ -4025,13 +4033,14 @@ fn populate_filtered_structural_nodes(
     }
 
     for root_id in graph.top_level_parts.keys() {
-        if let Some(tree) = InstanceNode::expand_from_graph(graph, root_id, 3) {
+        if let Some(tree) = InstanceNode::expand_from_graph(graph, root_id, max_depth.max(3)) {
             collect_layout_nodes_filtered(
                 graph,
                 &tree,
                 None,
                 include_root_parent,
                 Some(filter),
+                expand_matched_descendants,
                 expanded_keys,
                 input,
                 meta,
@@ -4041,13 +4050,14 @@ fn populate_filtered_structural_nodes(
 
     if input.nodes.len() == before_count {
         for root in part_def_roots.iter().take(max_part_defs) {
-            if let Some(tree) = InstanceNode::expand_from_graph(graph, root, 2) {
+            if let Some(tree) = InstanceNode::expand_from_graph(graph, root, max_depth) {
                 collect_layout_nodes_filtered(
                     graph,
                     &tree,
                     None,
                     include_root_parent,
                     Some(filter),
+                    expand_matched_descendants,
                     expanded_keys,
                     input,
                     meta,
@@ -4270,13 +4280,14 @@ fn build_structural_layout(
             );
         }
         ViewScope::AdHocRoot(root_id) => {
-            if let Some(tree) = InstanceNode::expand_from_graph(graph, root_id, 3) {
+            if let Some(tree) = InstanceNode::expand_from_graph(graph, root_id, 4) {
                 collect_layout_nodes_filtered(
                     graph,
                     &tree,
                     None,
                     include_root_parent,
                     None,
+                    view_kind == ViewKind::Interconnection,
                     &mut expanded_keys,
                     input,
                     meta,
@@ -4315,11 +4326,9 @@ fn build_structural_layout(
         }
         let (src_part, src_port) = split_port_ref(&conn.source_path);
         let (dst_part, dst_port) = split_port_ref(&conn.target_path);
-        let src_short = src_part.rsplit('.').next().unwrap_or(src_part);
-        let dst_short = dst_part.rsplit('.').next().unwrap_or(dst_part);
         if let (Some(src_node), Some(dst_node)) = (
-            visible_by_short.get(src_short),
-            visible_by_short.get(dst_short),
+            resolve_connection_node_path(src_part, &conn.owner_scope, &input.nodes, &visible_by_short),
+            resolve_connection_node_path(dst_part, &conn.owner_scope, &input.nodes, &visible_by_short),
         ) {
             input.edges.push(LayoutEdgeSpec {
                 id: format!("{}#{idx}", conn.id),
@@ -4546,12 +4555,14 @@ fn fit_generic_element_size(
     (width, height)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_layout_nodes_filtered(
     graph: &DefinitionGraph,
     node: &InstanceNode,
     parent_path: Option<&InstancePath>,
     is_compound_root: bool,
     filter: Option<&ViewFilter>,
+    expand_matched_descendants: bool,
     seen_keys: &mut BTreeSet<String>,
     input: &mut LayoutInput,
     meta: &mut BTreeMap<String, NodeMeta>,
@@ -4672,13 +4683,18 @@ fn collect_layout_nodes_filtered(
     }
 
     let next_parent = if self_matches {
-        if is_compound_root || parent_path.is_none() {
+        if is_compound_root || expand_matched_descendants || parent_path.is_none() {
             Some(&node.path)
         } else {
             parent_path
         }
     } else {
         parent_path
+    };
+    let child_filter = if self_matches && expand_matched_descendants {
+        None
+    } else {
+        filter
     };
 
     for child in &node.children {
@@ -4687,12 +4703,55 @@ fn collect_layout_nodes_filtered(
             child,
             next_parent,
             false,
-            filter,
+            child_filter,
+            expand_matched_descendants,
             seen_keys,
             input,
             meta,
         );
     }
+}
+
+fn path_matches_segments(path: &InstancePath, segments: &[&str]) -> bool {
+    if segments.is_empty() || path.0.len() < segments.len() {
+        return false;
+    }
+    path.0[path.0.len() - segments.len()..]
+        .iter()
+        .zip(segments.iter())
+        .all(|(id, seg)| id.short_name() == *seg)
+}
+
+fn resolve_connection_node_path(
+    part_ref: &str,
+    owner_scope: &ElementId,
+    nodes: &[LayoutNodeSpec],
+    visible_by_short: &BTreeMap<String, InstancePath>,
+) -> Option<InstancePath> {
+    let segments: Vec<&str> = part_ref.split('.').filter(|s| !s.is_empty()).collect();
+    let owner_key = owner_scope.as_str();
+    let owner_short = owner_scope.short_name();
+    if !segments.is_empty() {
+        if !owner_key.is_empty() {
+            if let Some(found) = nodes.iter().find(|n| {
+                path_matches_segments(&n.path, &segments)
+                    && n.path
+                        .0
+                        .iter()
+                        .any(|seg| seg.as_str() == owner_key || seg.short_name() == owner_short)
+            }) {
+                return Some(found.path.clone());
+            }
+        }
+        if let Some(found) = nodes
+            .iter()
+            .find(|n| path_matches_segments(&n.path, &segments))
+        {
+            return Some(found.path.clone());
+        }
+    }
+    let short = part_ref.rsplit('.').next().unwrap_or(part_ref);
+    visible_by_short.get(short).cloned()
 }
 
 fn split_port_ref(path: &str) -> (&str, Option<&str>) {
@@ -5123,6 +5182,164 @@ mod tests {
             app.graph.connections.len(),
             initial_conns + 1,
             "connecting two ports must add a connection to the parsed model"
+        );
+    }
+
+    #[test]
+    fn interconnection_view_exposes_nested_subsystems_ports_and_connections() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "types.sysml".into(),
+            r#"package RoverTypes {
+    item def ElectricalPower;
+    item def DriveCommand;
+    item def SensorFrame;
+    item def InspectionImage;
+    item def Telemetry;
+    port def PowerPort { out item power : ElectricalPower; }
+    port def CommandPort { out item command : DriveCommand; }
+    port def SensorPort { out item scanData : SensorFrame; }
+    port def ImagePort { out item image : InspectionImage; }
+    port def TelemetryPort { out item report : Telemetry; }
+}"#
+            .into(),
+        );
+        files.insert(
+            "components.sysml".into(),
+            r#"package RoverComponents {
+    private import ScalarValues::*;
+    private import RoverTypes::*;
+    part def Battery {
+        attribute capacityWh : Real default = 480.0;
+        out port supply : PowerPort;
+    }
+    part def Distribution {
+        in port input : PowerPort;
+        out port drive : PowerPort;
+        out port compute : PowerPort;
+        out port payload : PowerPort;
+    }
+    part def Drive {
+        attribute maximumSpeedMps : Real default = 1.5;
+        in port power : PowerPort;
+        in port command : CommandPort;
+    }
+    part def Controller {
+        attribute obstacleStopDistanceM : Real default = 0.8;
+        in port power : PowerPort;
+        in port perception : SensorPort;
+        in port images : ImagePort;
+        out port drive : CommandPort;
+        out port status : TelemetryPort;
+    }
+    part def Lidar {
+        attribute rangeM : Real default = 12.0;
+        out port scan : SensorPort;
+    }
+    part def Camera {
+        attribute resolutionMP : Real default = 12.0;
+        in port power : PowerPort;
+        out port image : ImagePort;
+    }
+    part def Radio {
+        attribute rangeM : Real default = 300.0;
+        in port telemetry : TelemetryPort;
+    }
+}"#
+            .into(),
+        );
+        files.insert(
+            "system.sysml".into(),
+            r#"package RoverSystem {
+    private import RoverComponents::*;
+    part def InspectionRover {
+        part energy {
+            part battery : Battery;
+            part distribution : Distribution;
+            connection batterySupply connect battery.supply to distribution.input;
+        }
+        part mobility {
+            part leftDrive : Drive;
+            part rightDrive : Drive;
+        }
+        part autonomy {
+            part controller : Controller;
+            part lidar : Lidar;
+            connection obstacleScan connect lidar.scan to controller.perception;
+        }
+        part inspection {
+            part camera : Camera;
+            part radio : Radio;
+        }
+        connection leftPower connect energy.distribution.drive to mobility.leftDrive.power;
+        connection rightPower connect energy.distribution.drive to mobility.rightDrive.power;
+        connection computePower connect energy.distribution.compute to autonomy.controller.power;
+        connection cameraPower connect energy.distribution.payload to inspection.camera.power;
+        connection leftCommand connect autonomy.controller.drive to mobility.leftDrive.command;
+        connection rightCommand connect autonomy.controller.drive to mobility.rightDrive.command;
+        connection inspectionImages connect inspection.camera.image to autonomy.controller.images;
+        connection missionTelemetry connect autonomy.controller.status to inspection.radio.telemetry;
+    }
+    part rover : InspectionRover;
+}"#
+            .into(),
+        );
+        files.insert(
+            "views.sysml".into(),
+            r#"package RoverViews {
+    private import StandardViewDefinitions::*;
+    view architecture : InterconnectionView { expose RoverSystem::InspectionRover; }
+}"#
+            .into(),
+        );
+
+        let parsed = SysmlEngine::parse_workspace(&files);
+        let (base_input, _) = build_layout_input_for_view(
+            &parsed.graph,
+            &ViewScope::SysmlView(ElementId::new("RoverViews::architecture")),
+            ViewKind::Interconnection,
+            LayoutDirection::LeftToRight,
+        );
+        let layout = syssur_layout::compute_deterministic_layout(&base_input);
+
+        assert_eq!(
+            layout.nodes.len(),
+            13,
+            "expected InspectionRover + 4 subsystems + 8 component parts, got {:?}",
+            layout.nodes.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            layout.edges.len(),
+            10,
+            "expected all 10 architecture connections (8 cross-subsystem + 2 internal)"
+        );
+
+        let parent_of: BTreeMap<String, InstancePath> = base_input
+            .nodes
+            .iter()
+            .filter_map(|n| Some((n.path.canonical_key(), n.parent.clone()?)))
+            .collect();
+        let battery_key = layout
+            .nodes
+            .keys()
+            .find(|k| k.ends_with("energy::battery"))
+            .expect("battery node")
+            .clone();
+        let energy_parent = parent_of
+            .get(&battery_key)
+            .expect("battery must have energy container parent");
+        assert!(energy_parent.canonical_key().ends_with("energy"));
+        let root_parent = parent_of
+            .get(&energy_parent.canonical_key())
+            .expect("energy must have InspectionRover parent");
+        assert!(root_parent.canonical_key().ends_with("InspectionRover"));
+
+        let r_battery = layout.nodes[&battery_key].rect;
+        let r_energy = layout.nodes[&energy_parent.canonical_key()].rect;
+        let r_root = layout.nodes[&root_parent.canonical_key()].rect;
+        assert!(
+            r_battery.y >= r_energy.y + 38.0 && r_energy.y >= r_root.y + 38.0,
+            "3-level containers must enclose children with header clearance"
         );
     }
 }

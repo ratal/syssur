@@ -490,6 +490,12 @@ fn extract_definition(
                         MemberKind::Usage(usage) => match usage.kind {
                             UsageKind::Part => {
                                 if let Some(pu) = build_part_usage(file, &def_id, usage, mspan) {
+                                    collect_nested_part_satisfies(
+                                        file,
+                                        &pu.id,
+                                        usage.body.as_deref(),
+                                        graph,
+                                    );
                                     part_def.parts.push(pu);
                                 }
                             }
@@ -1678,16 +1684,17 @@ fn build_port_usage(
     let is_conjugated = type_info.as_ref().is_some_and(|(_, c)| *c);
     let port_def = type_info.map(|(id, _)| id);
 
-    let mut direction = usage
-        .prefix
-        .direction
-        .map(map_direction)
-        .unwrap_or(PortDirection::InOut);
-    if let Some(ref pd_id) = port_def {
+    let direction = if let Some(explicit_dir) = usage.prefix.direction {
+        map_direction(explicit_dir).effective_direction(is_conjugated)
+    } else if let Some(ref pd_id) = port_def {
         if let Some(pd) = graph.resolve_port_def(pd_id) {
-            direction = pd.direction.effective_direction(is_conjugated);
+            pd.direction.effective_direction(is_conjugated)
+        } else {
+            PortDirection::InOut
         }
-    }
+    } else {
+        PortDirection::InOut
+    };
 
     Some(PortUsage {
         id: parent_id.child(&name),
@@ -2159,5 +2166,56 @@ package Clause7Demo {
             .keys()
             .any(|id| id.short_name() == "vehiclePartsTree_Safety"));
         assert!(!parsed.graph.requirements.is_empty());
+    }
+
+    #[test]
+    fn extracts_nested_part_connections_and_explicit_port_directions() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "m.sysml".into(),
+            r#"package RoverPkg {
+    port def PowerPort { out item power; }
+    part def Battery {
+        out port supply : PowerPort;
+    }
+    part def Distribution {
+        in port input : PowerPort;
+    }
+    part def InspectionRover {
+        part energy {
+            part battery : Battery;
+            part distribution : Distribution;
+            connection batterySupply connect battery.supply to distribution.input;
+        }
+    }
+}"#
+            .into(),
+        );
+        let parsed = SysmlEngine::parse_workspace(&files);
+        assert!(
+            parsed
+                .graph
+                .connections
+                .iter()
+                .any(|c| c.name.as_deref() == Some("batterySupply")
+                    && c.source_path == "battery.supply"
+                    && c.target_path == "distribution.input"),
+            "expected nested batterySupply connection inside part energy, got {:?}",
+            parsed.graph.connections
+        );
+        let dist = parsed
+            .graph
+            .resolve_part_def(&ElementId::new("RoverPkg::Distribution"))
+            .expect("Distribution part def");
+        let input_port = dist
+            .ports
+            .iter()
+            .find(|p| p.name == "input")
+            .expect("input port");
+        assert_eq!(
+            input_port.direction,
+            PortDirection::In,
+            "explicit `in port` must keep PortDirection::In"
+        );
     }
 }

@@ -201,6 +201,10 @@ pub fn compute_layout_with_port_overrides(
 
     // 2. Build compound Dagre graph in sorted order.
     let has_compound = nodes.iter().any(|n| n.parent.is_some());
+    let parent_keys: BTreeSet<String> = nodes
+        .iter()
+        .filter_map(|n| n.parent.as_ref().map(|p| p.canonical_key()))
+        .collect();
     let mut graph: Graph<NodeLabel, EdgeLabel> = Graph::with_options(GraphOptions {
         directed: true,
         multigraph: true,
@@ -209,12 +213,15 @@ pub fn compute_layout_with_port_overrides(
 
     for node in &nodes {
         let key = node.path.canonical_key();
+        let is_parent = parent_keys.contains(&key);
         graph.set_node(
             key.clone(),
             Some(NodeLabel {
                 width: node.width as f64,
                 height: node.height as f64,
-                padding: 20.0,
+                padding: if is_parent { 32.0 } else { 20.0 },
+                padding_x: is_parent.then_some(26.0),
+                padding_y: is_parent.then_some(44.0),
                 ..Default::default()
             }),
         );
@@ -303,9 +310,25 @@ pub fn compute_layout_with_port_overrides(
         );
     }
 
-    // Expand compound parent containers so they enclose moved children cleanly.
-    if !node_offsets.is_empty() && has_compound {
-        for node in nodes.iter().rev() {
+    // Expand compound parent containers bottom-up so multi-level parents enclose all children
+    // with header clearance even on initial auto-layout and after interactive node drags.
+    if has_compound {
+        let mut child_order: Vec<usize> = (0..nodes.len()).collect();
+        child_order.sort_by(|&a, &b| {
+            nodes[b]
+                .path
+                .0
+                .len()
+                .cmp(&nodes[a].path.0.len())
+                .then_with(|| {
+                    nodes[a]
+                        .path
+                        .canonical_key()
+                        .cmp(&nodes[b].path.canonical_key())
+                })
+        });
+        for idx in child_order {
+            let node = &nodes[idx];
             if let Some(ref parent) = node.parent {
                 let ckey = node.path.canonical_key();
                 let pkey = parent.canonical_key();
@@ -313,9 +336,9 @@ pub fn compute_layout_with_port_overrides(
                     positioned_nodes.get(&ckey).map(|n| n.rect),
                     positioned_nodes.get_mut(&pkey),
                 ) {
-                    let pad_x = 24.0;
-                    let pad_top = 36.0;
-                    let pad_bot = 22.0;
+                    let pad_x = 22.0;
+                    let pad_top = 44.0;
+                    let pad_bot = 20.0;
                     let min_x = parent_node.rect.x.min(child_rect.x - pad_x);
                     let min_y = parent_node.rect.y.min(child_rect.y - pad_top);
                     let max_x = (parent_node.rect.x + parent_node.rect.w)
@@ -404,12 +427,15 @@ pub fn compute_layout_with_port_overrides(
         );
 
         // Keep `src_key` and `dst_key` as active obstacles so paths wrap around them cleanly
-        // outside their port stubs; only exclude strictly enclosing compound containers.
+        // outside their port stubs; exclude enclosing/ancestor compound containers.
         let mut excluded_keys = BTreeSet::new();
         for (okey, orect) in &obstacles {
             if okey != &src_key
                 && okey != &dst_key
-                && (rect_encloses(*orect, src_node.rect) || rect_encloses(*orect, dst_node.rect))
+                && (src_key.starts_with(&format!("{okey}/"))
+                    || dst_key.starts_with(&format!("{okey}/"))
+                    || rect_encloses(*orect, src_node.rect)
+                    || rect_encloses(*orect, dst_node.rect))
             {
                 excluded_keys.insert(okey.clone());
             }
@@ -1434,5 +1460,107 @@ mod tests {
         let node_a_rect = out_ovr.nodes[&p_a.canonical_key()].rect;
         assert!((port_a_ovr.anchor.x - (node_a_rect.x + node_a_rect.w * 0.3)).abs() < 0.5);
         assert!((port_a_ovr.anchor.y - node_a_rect.y).abs() < 0.5);
+    }
+
+    #[test]
+    fn three_level_compound_containers_enclose_descendants_bottom_up() {
+        let root = InstancePath::root(ElementId::new("RoverSystem::InspectionRover"));
+        let sub = root.push(ElementId::new("RoverSystem::InspectionRover::energy"));
+        let leaf_a = sub.push(ElementId::new("RoverSystem::InspectionRover::energy::battery"));
+        let leaf_b = sub.push(ElementId::new("RoverSystem::InspectionRover::energy::distribution"));
+
+        let input = LayoutInput {
+            direction: LayoutDirection::LeftToRight,
+            nodes: vec![
+                LayoutNodeSpec {
+                    path: root.clone(),
+                    parent: None,
+                    label: "InspectionRover".into(),
+                    shape: NodeShape::PartBlock,
+                    width: 160.0,
+                    height: 80.0,
+                    ports: vec![],
+                    span: Span::new("s.sysml", 1, 20),
+                },
+                LayoutNodeSpec {
+                    path: sub.clone(),
+                    parent: Some(root.clone()),
+                    label: "energy".into(),
+                    shape: NodeShape::PartBlock,
+                    width: 140.0,
+                    height: 60.0,
+                    ports: vec![],
+                    span: Span::new("s.sysml", 25, 40),
+                },
+                LayoutNodeSpec {
+                    path: leaf_a.clone(),
+                    parent: Some(sub.clone()),
+                    label: "battery".into(),
+                    shape: NodeShape::PartBlock,
+                    width: 160.0,
+                    height: 90.0,
+                    ports: vec![LayoutPortSpec {
+                        name: "supply".into(),
+                        direction: PortDirection::Out,
+                        is_conjugated: false,
+                        type_label: Some("PowerPort".into()),
+                        span: Span::new("s.sysml", 45, 50),
+                    }],
+                    span: Span::new("s.sysml", 42, 60),
+                },
+                LayoutNodeSpec {
+                    path: leaf_b.clone(),
+                    parent: Some(sub.clone()),
+                    label: "distribution".into(),
+                    shape: NodeShape::PartBlock,
+                    width: 160.0,
+                    height: 90.0,
+                    ports: vec![LayoutPortSpec {
+                        name: "input".into(),
+                        direction: PortDirection::In,
+                        is_conjugated: false,
+                        type_label: Some("PowerPort".into()),
+                        span: Span::new("s.sysml", 65, 70),
+                    }],
+                    span: Span::new("s.sysml", 62, 80),
+                },
+            ],
+            edges: vec![LayoutEdgeSpec {
+                id: "batterySupply#0".into(),
+                source_node: leaf_a.clone(),
+                source_port: Some("supply".into()),
+                target_node: leaf_b.clone(),
+                target_port: Some("input".into()),
+                kind: RelationshipKind::Connection,
+                label: Some("batterySupply".into()),
+                guard: None,
+                span: Span::new("s.sysml", 82, 95),
+            }],
+        };
+
+        let out = compute_deterministic_layout(&input);
+        let r_root = out.nodes[&root.canonical_key()].rect;
+        let r_sub = out.nodes[&sub.canonical_key()].rect;
+        let r_a = out.nodes[&leaf_a.canonical_key()].rect;
+        let r_b = out.nodes[&leaf_b.canonical_key()].rect;
+
+        assert!(
+            r_sub.x <= r_a.x - 20.0 && r_sub.y <= r_a.y - 40.0,
+            "sub container must enclose leaf_a with header clearance: sub={r_sub:?}, a={r_a:?}"
+        );
+        assert!(
+            r_sub.x + r_sub.w >= r_b.x + r_b.w + 20.0
+                && r_sub.y + r_sub.h >= r_b.y + r_b.h + 18.0,
+            "sub container must enclose leaf_b: sub={r_sub:?}, b={r_b:?}"
+        );
+        assert!(
+            r_root.x <= r_sub.x - 20.0
+                && r_root.y <= r_sub.y - 40.0
+                && r_root.x + r_root.w >= r_sub.x + r_sub.w + 20.0
+                && r_root.y + r_root.h >= r_sub.y + r_sub.h + 18.0,
+            "root container must enclose sub container: root={r_root:?}, sub={r_sub:?}"
+        );
+        assert_eq!(out.edges.len(), 1);
+        assert!(out.edges[0].waypoints.len() >= 2);
     }
 }
