@@ -381,6 +381,7 @@ pub fn compute_layout_with_port_overrides(
         if let Some(pnode) = positioned_nodes.get_mut(&key) {
             pnode.ports = pin_ports_on_border(
                 &key,
+                node.shape,
                 &node.ports,
                 pnode.rect,
                 &edges,
@@ -482,6 +483,7 @@ pub fn compute_layout_with_port_overrides(
 
 fn pin_ports_on_border(
     node_key: &str,
+    shape: NodeShape,
     specs: &[LayoutPortSpec],
     rect: Rect2,
     edges: &[LayoutEdgeSpec],
@@ -539,7 +541,21 @@ fn pin_ports_on_border(
             }
         }
 
-        let side = if conn_count > 0 && (sum_dx.abs() > 1.0 || sum_dy.abs() > 1.0) {
+        let side = if shape == NodeShape::ActionBox && direction == LayoutDirection::TopToBottom {
+            match p.direction.effective_direction(p.is_conjugated) {
+                PortDirection::In => PortSide::Left,
+                PortDirection::Out => PortSide::Right,
+                PortDirection::InOut => {
+                    let s = if inout_idx % 2 == 0 {
+                        PortSide::Left
+                    } else {
+                        PortSide::Right
+                    };
+                    inout_idx += 1;
+                    s
+                }
+            }
+        } else if conn_count > 0 && (sum_dx.abs() > 1.0 || sum_dy.abs() > 1.0) {
             if sum_dx.abs() >= sum_dy.abs() {
                 if sum_dx >= 0.0 {
                     PortSide::Right

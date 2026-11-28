@@ -8,8 +8,9 @@ use syssur_model::{
     ActionNode, ActionNodeKind, AttributeUsage, ConnectionEdge, ConstraintVerdictItem,
     DefinitionGraph, DiagnosticItem, DiagnosticSeverity, ElementId, ElementModifiers,
     FeatureOrigin, PackageNode, PartDef, PartUsage, PortDef, PortDirection, PortUsage,
-    RelationshipKind, RequirementNode, Span, StateNode, SuccessionEdge, SysmlElement,
-    SysmlElementKind, TraceLink, TransitionEdge, VerificationStatus, ViewDef, ViewKind,
+    RelationshipKind, RequirementNode, RequirementSubject, Span, StateNode, SuccessionEdge,
+    SysmlElement, SysmlElementKind, TraceLink, TransitionEdge, VerificationStatus, ViewDef,
+    ViewKind,
 };
 use sysmlv2_model::check::{
     constraint_checks, satisfaction_checks, validate_model_with, validate_semantics_with,
@@ -20,8 +21,8 @@ use sysmlv2_model::model::Model;
 use sysmlv2_model::prepared::PreparedLibrary;
 use sysmlv2_syntax::ast::{
     BinaryOp, DefKind, Definition, Expr, ExprKind, FeatureDirection, FeatureSpecialization,
-    Literal, Member, MemberKind, Multiplicity, PortionKind, SourceUnit, TargetRef, TriggerKind,
-    UnaryOp, Usage, UsageDetail, UsageKind, Visibility,
+    Literal, Member, MemberKind, Multiplicity, PortionKind, SourceUnit, StateSubactionKind,
+    TargetRef, TriggerKind, UnaryOp, Usage, UsageDetail, UsageKind, Visibility,
 };
 use sysmlv2_syntax::diag::Severity;
 use sysmlv2_syntax::parser::parse_source;
@@ -141,6 +142,7 @@ impl SysmlEngine {
             model.add_source(file.clone(), content);
             unit_files.push(file.clone());
         }
+        resolve_inherited_view_kinds(&mut graph);
 
         // Cross-file referential & semantic validation + constraint checks in one resolve pass.
         let mut resolved = ResolvedModel::build(&model);
@@ -552,7 +554,8 @@ fn extract_definition(
                                     if let Some(aname) = usage_name(usage) {
                                         let aid = def_id.child(&aname);
                                         let doc = extract_doc_from_members(usage.body.as_deref());
-                                        let children = extract_action_body(
+                                        let type_def = first_type_ref(usage).map(|(id, _)| id);
+                                        let (children, params) = extract_action_body(
                                             file,
                                             &aid,
                                             usage.body.as_deref(),
@@ -564,6 +567,9 @@ fn extract_definition(
                                                 id: aid,
                                                 name: aname,
                                                 kind: ActionNodeKind::Action,
+                                                is_def: false,
+                                                type_def,
+                                                params,
                                                 doc,
                                                 children,
                                                 span: mspan,
@@ -610,12 +616,18 @@ fn extract_definition(
         DefKind::Requirement => {
             let short_id = def.id.short_name.as_ref().map(|n| n.value.clone());
             let doc = extract_doc_from_members(def.body.as_deref());
+            let (subject, attributes, children) =
+                extract_requirement_body(file, &def_id, def.body.as_deref(), graph);
             graph.requirements.insert(
                 def_id.clone(),
                 RequirementNode {
                     id: def_id,
                     short_id,
                     name,
+                    type_def: None,
+                    subject,
+                    attributes,
+                    children,
                     doc,
                     is_usage: false,
                     span,
@@ -624,13 +636,16 @@ fn extract_definition(
         }
         DefKind::Action => {
             let doc = extract_doc_from_members(def.body.as_deref());
-            let children = extract_action_body(file, &def_id, def.body.as_deref(), graph);
+            let (children, params) = extract_action_body(file, &def_id, def.body.as_deref(), graph);
             graph.actions.insert(
                 def_id.clone(),
                 ActionNode {
                     id: def_id,
                     name,
                     kind: ActionNodeKind::Action,
+                    is_def: true,
+                    type_def: None,
+                    params,
                     doc,
                     children,
                     span,
@@ -654,13 +669,19 @@ fn extract_definition(
         }
         DefKind::View => {
             let expose_patterns = extract_expose_patterns(def.body.as_deref());
-            let kind = infer_view_kind(&name, None);
+            let base_views: Vec<ElementId> = def
+                .specializes
+                .iter()
+                .filter_map(target_ref_to_element_id)
+                .collect();
+            let kind = infer_view_kind(&name, base_views.first());
             graph.views.insert(
                 def_id.clone(),
                 ViewDef {
                     id: def_id,
                     name,
                     kind,
+                    base_views,
                     is_usage: false,
                     expose_patterns,
                     include_relationships: Vec::new(),
@@ -757,12 +778,19 @@ fn extract_top_level_usage(
                     .as_ref()
                     .map(|n| n.value.clone());
                 let doc = extract_doc_from_members(usage.body.as_deref());
+                let type_def = first_type_ref(usage).map(|(id, _)| id);
+                let (subject, attributes, children) =
+                    extract_requirement_body(file, &req_id, usage.body.as_deref(), graph);
                 graph.requirements.insert(
                     req_id.clone(),
                     RequirementNode {
                         id: req_id,
                         short_id,
                         name,
+                        type_def,
+                        subject,
+                        attributes,
+                        children,
                         doc,
                         is_usage: true,
                         span,
@@ -778,13 +806,18 @@ fn extract_top_level_usage(
                     owner.child(&name)
                 };
                 let doc = extract_doc_from_members(usage.body.as_deref());
-                let children = extract_action_body(file, &act_id, usage.body.as_deref(), graph);
+                let type_def = first_type_ref(usage).map(|(id, _)| id);
+                let (children, params) =
+                    extract_action_body(file, &act_id, usage.body.as_deref(), graph);
                 graph.actions.insert(
                     act_id.clone(),
                     ActionNode {
                         id: act_id,
                         name,
                         kind: ActionNodeKind::Action,
+                        is_def: false,
+                        type_def,
+                        params,
                         doc,
                         children,
                         span,
@@ -821,8 +854,24 @@ fn extract_top_level_usage(
                 } else {
                     owner.child(&name)
                 };
-                let type_ref = first_type_ref(usage).map(|(id, _)| id);
-                let kind = infer_view_kind(&name, type_ref.as_ref());
+                let mut base_views = Vec::new();
+                if let Some((ty, _)) = first_type_ref(usage) {
+                    base_views.push(ty);
+                }
+                for spec in &usage.declaration.specializations {
+                    if let FeatureSpecialization::Subsets(targets)
+                    | FeatureSpecialization::Redefines(targets) = spec
+                    {
+                        for t in targets {
+                            if let Some(id) = target_ref_to_element_id(t) {
+                                if !base_views.contains(&id) {
+                                    base_views.push(id);
+                                }
+                            }
+                        }
+                    }
+                }
+                let kind = infer_view_kind(&name, base_views.first());
                 let expose_patterns = extract_expose_patterns(usage.body.as_deref());
                 graph.views.insert(
                     view_id.clone(),
@@ -830,6 +879,7 @@ fn extract_top_level_usage(
                         id: view_id,
                         name,
                         kind,
+                        base_views,
                         is_usage: true,
                         expose_patterns,
                         include_relationships: Vec::new(),
@@ -968,6 +1018,7 @@ fn extract_verify_usage(
             kind: RelationshipKind::Verify,
             requirement: req_id,
             target: verifier,
+            is_asserted: false,
             span,
         });
     }
@@ -1054,12 +1105,19 @@ fn extract_state_body(
     for m in members {
         let mspan = Span::new(file, m.span.start as usize, m.span.end as usize);
         match &m.kind {
+            MemberKind::StateSubaction {
+                kind: StateSubactionKind::Entry,
+                ..
+            } => {
+                prev_state = Some("start".to_string());
+            }
             MemberKind::InitialNode(qn) => {
                 let target_name = qn.to_display_string();
                 if target_name != "start" {
                     graph.transitions.push(TransitionEdge {
                         id: owner_state.child(&format!("trans_{}", graph.transitions.len())),
                         owner_scope: owner_state.clone(),
+                        name: None,
                         source: "start".to_string(),
                         target: target_name.clone(),
                         trigger: None,
@@ -1082,9 +1140,44 @@ fn extract_state_body(
                         is_def: false,
                         doc,
                         children: nested,
-                        span: mspan,
+                        span: mspan.clone(),
                     });
+                    if m.leading_then {
+                        if let Some(ref src) = prev_state {
+                            graph.transitions.push(TransitionEdge {
+                                id: owner_state.child(&format!("trans_{}", graph.transitions.len())),
+                                owner_scope: owner_state.clone(),
+                                name: None,
+                                source: src.clone(),
+                                target: name.clone(),
+                                trigger: None,
+                                guard: None,
+                                effect: None,
+                                span: mspan,
+                            });
+                        }
+                    }
                     prev_state = Some(name);
+                } else if let UsageDetail::Succession { source, target } = &u.detail {
+                    let src_name = source
+                        .as_deref()
+                        .map(|s| target_ref_display(&s.target))
+                        .or_else(|| prev_state.clone());
+                    if let Some(src) = src_name {
+                        let dst_name = target_ref_display(&target.target);
+                        graph.transitions.push(TransitionEdge {
+                            id: owner_state.child(&format!("trans_{}", graph.transitions.len())),
+                            owner_scope: owner_state.clone(),
+                            name: usage_name(u),
+                            source: src,
+                            target: dst_name.clone(),
+                            trigger: None,
+                            guard: None,
+                            effect: None,
+                            span: mspan,
+                        });
+                        prev_state = Some(dst_name);
+                    }
                 } else if let UsageDetail::Transition {
                     source,
                     trigger,
@@ -1106,6 +1199,7 @@ fn extract_state_body(
                         graph.transitions.push(TransitionEdge {
                             id: owner_state.child(&format!("trans_{}", graph.transitions.len())),
                             owner_scope: owner_state.clone(),
+                            name: usage_name(u),
                             source: src,
                             target: dst_name.clone(),
                             trigger: trigger_str,
@@ -1218,7 +1312,8 @@ fn collect_nested_part_satisfies(
                         if let Some(aname) = usage_name(u) {
                             let aid = part_id.child(&aname);
                             let doc = extract_doc_from_members(u.body.as_deref());
-                            let children =
+                            let type_def = first_type_ref(u).map(|(id, _)| id);
+                            let (children, params) =
                                 extract_action_body(file, &aid, u.body.as_deref(), graph);
                             graph.actions.insert(
                                 aid.clone(),
@@ -1226,6 +1321,9 @@ fn collect_nested_part_satisfies(
                                     id: aid,
                                     name: aname,
                                     kind: ActionNodeKind::Action,
+                                    is_def: false,
+                                    type_def,
+                                    params,
                                     doc,
                                     children,
                                     span: mspan,
@@ -1238,6 +1336,85 @@ fn collect_nested_part_satisfies(
             }
         }
     }
+}
+
+fn extract_requirement_body(
+    file: &str,
+    owner_req: &ElementId,
+    body: Option<&[Member]>,
+    graph: &mut DefinitionGraph,
+) -> (
+    Option<RequirementSubject>,
+    Vec<AttributeUsage>,
+    Vec<ElementId>,
+) {
+    let Some(members) = body else {
+        return (None, Vec::new(), Vec::new());
+    };
+    let mut subject: Option<RequirementSubject> = None;
+    let mut attributes = Vec::new();
+    let mut children = Vec::new();
+
+    for m in members {
+        let mspan = Span::new(file, m.span.start as usize, m.span.end as usize);
+        match &m.kind {
+            MemberKind::Subject(u) => {
+                if subject.is_none() {
+                    if let Some(sname) = usage_name(u) {
+                        subject = Some(RequirementSubject {
+                            name: sname,
+                            type_def: first_type_ref(u).map(|(id, _)| id),
+                            value_expr: u.value.as_ref().map(|v| format_expr(&v.expr)),
+                            span: mspan,
+                        });
+                    }
+                }
+            }
+            MemberKind::Usage(u) => match u.kind {
+                UsageKind::Attribute => {
+                    if let Some(attr) = build_attribute_usage(owner_req, u, mspan) {
+                        attributes.push(attr);
+                    }
+                }
+                UsageKind::Requirement => {
+                    if let Some(name) = usage_name(u) {
+                        let child_id = owner_req.child(&name);
+                        let short_id = u.declaration.id.short_name.as_ref().map(|n| n.value.clone());
+                        let doc = extract_doc_from_members(u.body.as_deref());
+                        let type_def = first_type_ref(u).map(|(id, _)| id);
+                        graph
+                            .element_modifiers
+                            .insert(child_id.clone(), usage_modifiers(m.visibility, u));
+                        let (child_subj, child_attrs, child_children) =
+                            extract_requirement_body(file, &child_id, u.body.as_deref(), graph);
+                        graph.requirements.insert(
+                            child_id.clone(),
+                            RequirementNode {
+                                id: child_id.clone(),
+                                short_id,
+                                name,
+                                type_def,
+                                subject: child_subj,
+                                attributes: child_attrs,
+                                children: child_children,
+                                doc,
+                                is_usage: true,
+                                span: mspan,
+                            },
+                        );
+                        children.push(child_id);
+                    }
+                }
+                UsageKind::Satisfy => {
+                    extract_satisfy_usage(owner_req, u, mspan, graph);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    (subject, attributes, children)
 }
 
 fn extract_satisfy_usage(
@@ -1261,7 +1438,7 @@ fn extract_satisfy_usage(
             _ => None,
         })
         .or_else(|| usage_name(usage).map(ElementId::new));
-    if let (Some(req_id), UsageDetail::Satisfy { by, .. }) = (req, &usage.detail) {
+    if let (Some(req_id), UsageDetail::Satisfy { asserted, by, .. }) = (req, &usage.detail) {
         let target = by
             .as_ref()
             .map(target_ref_display)
@@ -1270,6 +1447,7 @@ fn extract_satisfy_usage(
             kind: RelationshipKind::Satisfy,
             requirement: req_id,
             target,
+            is_asserted: *asserted,
             span,
         });
     }
@@ -1302,20 +1480,25 @@ fn extract_expose_patterns(body: Option<&[Member]>) -> Vec<String> {
     expose_patterns
 }
 
+fn infer_standard_view_kind(type_ref: &ElementId) -> Option<ViewKind> {
+    let s = type_ref.short_name();
+    if s.eq_ignore_ascii_case("StateTransitionView") || s.contains("StateTransition") {
+        Some(ViewKind::StateTransition)
+    } else if s.eq_ignore_ascii_case("ActionFlowView") || s.contains("ActionFlow") {
+        Some(ViewKind::ActionFlow)
+    } else if s.eq_ignore_ascii_case("InterconnectionView") || s.contains("Interconnection") {
+        Some(ViewKind::Interconnection)
+    } else if s.eq_ignore_ascii_case("GeneralView") || s.contains("General") {
+        Some(ViewKind::General)
+    } else {
+        None
+    }
+}
+
 fn infer_view_kind(name: &str, type_ref: Option<&ElementId>) -> ViewKind {
     if let Some(tr) = type_ref {
-        let s = tr.short_name();
-        if s.eq_ignore_ascii_case("StateTransitionView") || s.contains("StateTransition") {
-            return ViewKind::StateTransition;
-        }
-        if s.eq_ignore_ascii_case("ActionFlowView") || s.contains("ActionFlow") {
-            return ViewKind::ActionFlow;
-        }
-        if s.eq_ignore_ascii_case("InterconnectionView") || s.contains("Interconnection") {
-            return ViewKind::Interconnection;
-        }
-        if s.eq_ignore_ascii_case("GeneralView") || s.contains("General") {
-            return ViewKind::General;
+        if let Some(kind) = infer_standard_view_kind(tr) {
+            return kind;
         }
     }
     let lower = name.to_ascii_lowercase();
@@ -1330,16 +1513,73 @@ fn infer_view_kind(name: &str, type_ref: Option<&ElementId>) -> ViewKind {
     }
 }
 
+fn resolve_inherited_view_kinds(graph: &mut DefinitionGraph) {
+    fn resolve_recursive(
+        views: &BTreeMap<ElementId, ViewDef>,
+        view_id: &ElementId,
+        visited: &mut BTreeSet<ElementId>,
+    ) -> Option<ViewKind> {
+        if !visited.insert(view_id.clone()) {
+            return None;
+        }
+        let view = views.get(view_id)?;
+        for base in &view.base_views {
+            if let Some(kind) = infer_standard_view_kind(base) {
+                return Some(kind);
+            }
+        }
+        let scope_prefix = view_id.as_str().rsplit_once("::").map(|(p, _)| p);
+        for base in &view.base_views {
+            let short = base.short_name();
+            let target_id = if views.contains_key(base) {
+                Some(base.clone())
+            } else if let Some(prefix) = scope_prefix {
+                let sibling = ElementId::new(format!("{prefix}::{short}"));
+                if views.contains_key(&sibling) {
+                    Some(sibling)
+                } else {
+                    views
+                        .values()
+                        .find(|v| v.name == short || v.id.as_str().ends_with(&format!("::{short}")))
+                        .map(|v| v.id.clone())
+                }
+            } else {
+                views
+                    .values()
+                    .find(|v| v.name == short || v.id.as_str().ends_with(&format!("::{short}")))
+                    .map(|v| v.id.clone())
+            };
+            if let Some(tid) = target_id {
+                if let Some(kind) = resolve_recursive(views, &tid, visited) {
+                    return Some(kind);
+                }
+            }
+        }
+        None
+    }
+
+    let ids: Vec<ElementId> = graph.views.keys().cloned().collect();
+    for id in ids {
+        let mut visited = BTreeSet::new();
+        if let Some(kind) = resolve_recursive(&graph.views, &id, &mut visited) {
+            if let Some(v) = graph.views.get_mut(&id) {
+                v.kind = kind;
+            }
+        }
+    }
+}
+
 fn extract_action_body(
     file: &str,
     owner_action: &ElementId,
     body: Option<&[Member]>,
     graph: &mut DefinitionGraph,
-) -> Vec<ActionNode> {
+) -> (Vec<ActionNode>, Vec<PortUsage>) {
     let Some(members) = body else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let mut children = Vec::new();
+    let mut params = Vec::new();
     let mut prev_node: Option<String> = None;
     let mut has_start = false;
     let mut has_done = false;
@@ -1382,7 +1622,13 @@ fn extract_action_body(
                     let name = usage_name(u).unwrap_or_else(|| format!("{nk:?}"));
                     let child_id = owner_action.child(&name);
                     let doc = extract_doc_from_members(u.body.as_deref());
-                    let nested = extract_action_body(file, &child_id, u.body.as_deref(), graph);
+                    let type_def = if nk == ActionNodeKind::Action {
+                        first_type_ref(u).map(|(id, _)| id)
+                    } else {
+                        None
+                    };
+                    let (nested, child_params) =
+                        extract_action_body(file, &child_id, u.body.as_deref(), graph);
                     if m.leading_then {
                         if let Some(ref prev) = prev_node {
                             graph.successions.push(SuccessionEdge {
@@ -1400,12 +1646,31 @@ fn extract_action_body(
                         id: child_id,
                         name: name.clone(),
                         kind: nk,
+                        is_def: false,
+                        type_def,
+                        params: child_params,
                         doc,
                         children: nested,
                         span: mspan,
                     });
                     prev_node = Some(name);
                     continue;
+                }
+
+                if u.prefix.direction.is_some()
+                    && !matches!(
+                        &u.detail,
+                        UsageDetail::Flow { .. }
+                            | UsageDetail::Succession { .. }
+                            | UsageDetail::Transition { .. }
+                            | UsageDetail::Connector { .. }
+                            | UsageDetail::Binding { .. }
+                    )
+                {
+                    if let Some(param) = build_port_usage(owner_action, u, mspan.clone(), graph) {
+                        params.push(param);
+                        continue;
+                    }
                 }
 
                 match &u.detail {
@@ -1469,6 +1734,13 @@ fn extract_action_body(
                             prev_node = Some(dst_name);
                         }
                     }
+                    UsageDetail::Flow { .. }
+                    | UsageDetail::Connector { .. }
+                    | UsageDetail::Binding { .. } => {
+                        if let Some(edge) = build_connection_edge(owner_action, u, mspan) {
+                            graph.connections.push(edge);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1483,6 +1755,9 @@ fn extract_action_body(
                 id: owner_action.child("start"),
                 name: "start".to_string(),
                 kind: ActionNodeKind::Start,
+                is_def: false,
+                type_def: None,
+                params: Vec::new(),
                 doc: None,
                 children: Vec::new(),
                 span: synthetic_start_span,
@@ -1494,13 +1769,16 @@ fn extract_action_body(
             id: owner_action.child("done"),
             name: "done".to_string(),
             kind: ActionNodeKind::Done,
+            is_def: false,
+            type_def: None,
+            params: Vec::new(),
             doc: None,
             children: Vec::new(),
             span: synthetic_done_span,
         });
     }
 
-    children
+    (children, params)
 }
 
 fn format_expr(expr: &Expr) -> String {
@@ -2216,6 +2494,193 @@ package Clause7Demo {
             input_port.direction,
             PortDirection::In,
             "explicit `in port` must keep PortDirection::In"
+        );
+    }
+
+    #[test]
+    fn extracts_state_entry_initial_transition_and_transition_names() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "behavior.sysml".into(),
+            r#"package RoverBehavior {
+    state def OperatingMode {
+        entry; then docked;
+        state docked;
+        state patrolling;
+        transition dispatch first docked then patrolling;
+    }
+}"#
+            .into(),
+        );
+        let parsed = SysmlEngine::parse_workspace(&files);
+        assert!(
+            parsed
+                .graph
+                .transitions
+                .iter()
+                .any(|t| t.source == "start" && t.target == "docked"),
+            "expected initial transition start -> docked from `entry; then docked;`, got {:?}",
+            parsed.graph.transitions
+        );
+        assert!(
+            parsed.graph.transitions.iter().any(|t| {
+                t.source == "docked"
+                    && t.target == "patrolling"
+                    && t.name.as_deref() == Some("dispatch")
+            }),
+            "expected named transition `dispatch`, got {:?}",
+            parsed.graph.transitions
+        );
+    }
+
+    #[test]
+    fn resolves_custom_view_def_specialization_and_view_usage_typing() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "views.sysml".into(),
+            r#"package CompressorViews {
+    private import StandardViewDefinitions::*;
+    view overview : Structure { expose CompressorSystem::WorkshopContext; }
+    view maintenance : Actions { expose CompressorBehavior::ServiceCompressor; }
+    view states : States { expose CompressorBehavior::OperatingMode; }
+    view def Structure :> InterconnectionView;
+    view def Actions :> ActionFlowView;
+    view def States :> StateTransitionView;
+}"#
+            .into(),
+        );
+        let parsed = SysmlEngine::parse_workspace(&files);
+        assert_eq!(
+            parsed.graph.views[&ElementId::new("CompressorViews::overview")].kind,
+            ViewKind::Interconnection
+        );
+        assert_eq!(
+            parsed.graph.views[&ElementId::new("CompressorViews::maintenance")].kind,
+            ViewKind::ActionFlow
+        );
+        assert_eq!(
+            parsed.graph.views[&ElementId::new("CompressorViews::states")].kind,
+            ViewKind::StateTransition
+        );
+        assert_eq!(
+            parsed.graph.views[&ElementId::new("CompressorViews::Structure")].kind,
+            ViewKind::Interconnection
+        );
+    }
+
+    #[test]
+    fn extracts_action_def_params_typed_usages_and_item_flows() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "behavior.sysml".into(),
+            r#"package CompressorBehavior {
+    item def PressureReading;
+    item def ControlCommand;
+    action def SensePressure {
+        out item reading : PressureReading;
+    }
+    action def ControlMotor {
+        in item reading : PressureReading;
+        out item command : ControlCommand;
+    }
+    action def CompressAir {
+        action sense : SensePressure;
+        action control : ControlMotor;
+        first start then sense;
+        first sense then control;
+        first control then done;
+        flow from sense.reading to control.reading;
+    }
+}"#
+            .into(),
+        );
+        let parsed = SysmlEngine::parse_workspace(&files);
+        let sense_def = &parsed.graph.actions[&ElementId::new("CompressorBehavior::SensePressure")];
+        assert!(sense_def.is_def);
+        assert_eq!(sense_def.params.len(), 1);
+        assert_eq!(sense_def.params[0].name, "reading");
+        assert_eq!(sense_def.params[0].direction, PortDirection::Out);
+
+        let control_def = &parsed.graph.actions[&ElementId::new("CompressorBehavior::ControlMotor")];
+        assert_eq!(control_def.params.len(), 2);
+        assert_eq!(control_def.params[0].direction, PortDirection::In);
+        assert_eq!(control_def.params[1].direction, PortDirection::Out);
+
+        let compress = &parsed.graph.actions[&ElementId::new("CompressorBehavior::CompressAir")];
+        assert!(compress.is_def);
+        let sense_child = compress.children.iter().find(|c| c.name == "sense").unwrap();
+        assert!(!sense_child.is_def);
+        assert_eq!(
+            sense_child.type_def.as_ref().map(|t| t.as_str()),
+            Some("SensePressure")
+        );
+
+        let flows: Vec<_> = parsed
+            .graph
+            .connections
+            .iter()
+            .filter(|c| {
+                c.owner_scope == compress.id && c.kind == RelationshipKind::Flow
+            })
+            .collect();
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].source_path, "sense.reading");
+        assert_eq!(flows[0].target_path, "control.reading");
+    }
+
+    #[test]
+    fn extracts_nested_requirements_subjects_and_attributes() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "reqs.sysml".into(),
+            r#"package CompressorRequirements {
+    private import ScalarValues::*;
+    part def Tank;
+    part def Compressor;
+    requirement def <'COMP-001'> SafePressure {
+        doc /* Tank pressure shall not exceed 800000 Pa. */
+        subject tank : Tank;
+        attribute maximum : Real default = 800000.0;
+    }
+    requirement workshopSpecification {
+        doc /* Bounds and declared trace links. */
+        subject compressor : Compressor;
+        requirement pressure : SafePressure { subject tank = compressor; }
+    }
+}"#
+            .into(),
+        );
+        let parsed = SysmlEngine::parse_workspace(&files);
+        let safe_p = &parsed.graph.requirements[&ElementId::new("CompressorRequirements::SafePressure")];
+        assert!(!safe_p.is_usage);
+        assert_eq!(safe_p.short_id.as_deref(), Some("COMP-001"));
+        assert_eq!(
+            safe_p.subject.as_ref().map(|s| s.name.as_str()),
+            Some("tank")
+        );
+        assert_eq!(
+            safe_p
+                .subject
+                .as_ref()
+                .and_then(|s| s.type_def.as_ref())
+                .map(|t| t.as_str()),
+            Some("Tank")
+        );
+        assert_eq!(safe_p.attributes.len(), 1);
+        assert_eq!(safe_p.attributes[0].name, "maximum");
+
+        let spec = &parsed.graph.requirements
+            [&ElementId::new("CompressorRequirements::workshopSpecification")];
+        assert_eq!(spec.children.len(), 1);
+        assert_eq!(
+            spec.children[0].as_str(),
+            "CompressorRequirements::workshopSpecification::pressure"
+        );
+        let nested_p = &parsed.graph.requirements[&spec.children[0]];
+        assert_eq!(nested_p.type_def.as_ref().map(|t| t.as_str()), Some("SafePressure"));
+        assert_eq!(
+            nested_p.subject.as_ref().and_then(|s| s.value_expr.as_deref()),
+            Some("compressor")
         );
     }
 }

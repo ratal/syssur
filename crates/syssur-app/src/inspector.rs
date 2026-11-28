@@ -1197,7 +1197,7 @@ fn details_for_requirement(
         origin_label: None,
         short_id: req.short_id.clone(),
         doc: req.doc.clone(),
-        type_name: None,
+        type_name: req.type_def.as_ref().map(|d| d.short_name().to_string()),
         multiplicity: None,
         modifiers: graph
             .element_modifiers
@@ -1250,7 +1250,13 @@ fn details_for_action(
     mods: ElementModifiers,
 ) -> ResolvedDetails {
     let kind_label = match act.kind {
-        ActionNodeKind::Action => "Action",
+        ActionNodeKind::Action => {
+            if act.is_def {
+                "Action Definition"
+            } else {
+                "Action"
+            }
+        }
         ActionNodeKind::Start => "Start Node",
         ActionNodeKind::Done => "Done Node",
         ActionNodeKind::Fork => "Fork Node",
@@ -1259,7 +1265,10 @@ fn details_for_action(
         ActionNodeKind::Merge => "Merge Node",
     };
     ResolvedDetails {
-        key: format!("act:{}:{:?}", act.id, act.doc),
+        key: format!(
+            "act:{}:{}:{:?}:{:?}",
+            act.id, act.is_def, act.type_def, act.doc
+        ),
         kind_label: kind_label.to_string(),
         kind_hint: None,
         qualified_name: act.id.as_str().to_string(),
@@ -1268,7 +1277,7 @@ fn details_for_action(
         origin_label: None,
         short_id: None,
         doc: act.doc.clone(),
-        type_name: None,
+        type_name: act.type_def.as_ref().map(|t| t.as_str().to_string()),
         multiplicity: None,
         modifiers: graph
             .element_modifiers
@@ -1277,7 +1286,7 @@ fn details_for_action(
             .unwrap_or(mods),
         supports_doc: act.kind == ActionNodeKind::Action,
         supports_short_id: false,
-        supports_type: false,
+        supports_type: act.kind == ActionNodeKind::Action && !act.is_def,
         supports_def_usage: act.kind == ActionNodeKind::Action,
         supports_modifiers: act.kind == ActionNodeKind::Action,
         block_editor: None,

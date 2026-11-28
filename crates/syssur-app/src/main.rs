@@ -29,8 +29,8 @@ use syssur_layout::{
 };
 use syssur_model::{
     ActionNode, ActionNodeKind, DefinitionGraph, DiagnosticSeverity, ElementId, FeatureOrigin,
-    InstanceNode, InstancePath, PackageNode, RelationshipKind, StateNode, SysmlElementKind,
-    VerificationStatus, ViewFilter, ViewKind,
+    InstanceNode, InstancePath, PackageNode, PortDirection, PortUsage, RelationshipKind,
+    StateNode, SysmlElementKind, VerificationStatus, ViewFilter, ViewKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -288,7 +288,16 @@ impl SyssurApp {
             .unwrap_or_else(|| ElementId::new("Model"));
 
         let mut initial_tabs = Vec::new();
-        let views: Vec<_> = self.graph.views.values().cloned().collect();
+        let mut views: Vec<_> = self
+            .graph
+            .views
+            .values()
+            .filter(|v| v.is_usage)
+            .cloned()
+            .collect();
+        if views.is_empty() {
+            views = self.graph.views.values().cloned().collect();
+        }
         for v in views.iter().take(2) {
             let tid = self.allocate_view_tab(
                 v.name.clone(),
@@ -1710,7 +1719,7 @@ impl SyssurApp {
             .map(|(_, t)| t)
         {
             Some(SelectedTarget::Edge {
-                name: None,
+                name: tr.name.clone(),
                 source: tr.source.clone(),
                 target: tr.target.clone(),
                 source_port: None,
@@ -2851,23 +2860,32 @@ fn render_explorer_package(
         }
 
         // Views
-        for v in graph
+        let mut pkg_views: Vec<&syssur_model::ViewDef> = graph
             .views
             .values()
             .filter(|v| is_direct_pkg_child(&pkg.id, &v.id))
-        {
+            .collect();
+        pkg_views.sort_by_key(|v| (!v.is_usage, v.name.clone()));
+        for v in pkg_views {
             let selected = matches!(selected_target, SelectedTarget::Element(id) if id == &v.id);
+            let view_label = if v.is_usage {
+                format!("view {}", v.name)
+            } else {
+                format!("view def {}", v.name)
+            };
             let resp = explorer_icon_row(
                 ui,
                 selected,
                 CatalogCategory::ViewsAndMetadata,
                 "view",
                 !v.is_usage,
-                format!("view {}", v.name),
+                view_label,
                 None,
             );
             if resp.clicked() {
-                *open_view_id = Some(v.id.clone());
+                if v.is_usage || !v.expose_patterns.is_empty() {
+                    *open_view_id = Some(v.id.clone());
+                }
                 *select_elem = Some(v.id.clone());
             }
             resp.context_menu(|ui| {
@@ -3730,16 +3748,34 @@ fn build_action_flow_layout(
         }
     }
 
+    let mut visible_scopes: std::collections::BTreeSet<ElementId> =
+        std::collections::BTreeSet::new();
+    let mut path_by_scope_name: BTreeMap<(ElementId, String), InstancePath> = BTreeMap::new();
     let mut path_by_name: BTreeMap<String, InstancePath> = BTreeMap::new();
     for root in roots {
-        collect_action_nodes_recursive(root, None, &mut path_by_name, input, meta);
+        collect_action_nodes_recursive(
+            graph,
+            root,
+            None,
+            &mut visible_scopes,
+            &mut path_by_scope_name,
+            &mut path_by_name,
+            input,
+            meta,
+        );
     }
 
     for (idx, succ) in graph.successions.iter().enumerate() {
-        if let (Some(src), Some(dst)) = (
-            path_by_name.get(&succ.source),
-            path_by_name.get(&succ.target),
-        ) {
+        if !visible_scopes.contains(&succ.owner_scope) {
+            continue;
+        }
+        let src = path_by_scope_name
+            .get(&(succ.owner_scope.clone(), succ.source.clone()))
+            .or_else(|| path_by_name.get(&succ.source));
+        let dst = path_by_scope_name
+            .get(&(succ.owner_scope.clone(), succ.target.clone()))
+            .or_else(|| path_by_name.get(&succ.target));
+        if let (Some(src), Some(dst)) = (src, dst) {
             input.edges.push(LayoutEdgeSpec {
                 id: format!("{}#{idx}", succ.id),
                 source_node: src.clone(),
@@ -3753,11 +3789,79 @@ fn build_action_flow_layout(
             });
         }
     }
+
+    for (idx, conn) in graph.connections.iter().enumerate() {
+        if conn.kind != RelationshipKind::Flow || !visible_scopes.contains(&conn.owner_scope) {
+            continue;
+        }
+        let (src_part, src_port) = split_port_ref(&conn.source_path);
+        let (dst_part, dst_port) = split_port_ref(&conn.target_path);
+        let src = path_by_scope_name
+            .get(&(conn.owner_scope.clone(), src_part.to_string()))
+            .or_else(|| path_by_name.get(src_part));
+        let dst = path_by_scope_name
+            .get(&(conn.owner_scope.clone(), dst_part.to_string()))
+            .or_else(|| path_by_name.get(dst_part));
+        if let (Some(src), Some(dst)) = (src, dst) {
+            let flow_label = match (src_port, dst_port) {
+                (Some(sp), Some(tp)) => Some(format!("{sp} to {tp}")),
+                _ => conn.name.clone(),
+            };
+            input.edges.push(LayoutEdgeSpec {
+                id: format!("{}#flow_{idx}", conn.id),
+                source_node: src.clone(),
+                source_port: src_port.map(str::to_string),
+                target_node: dst.clone(),
+                target_port: dst_port.map(str::to_string),
+                kind: RelationshipKind::Flow,
+                label: flow_label,
+                guard: None,
+                span: conn.span.clone(),
+            });
+        }
+    }
 }
 
+fn fit_action_box_size(
+    label: &str,
+    type_name: Option<&str>,
+    stereotype: &str,
+    ports: &[LayoutPortSpec],
+    has_children: bool,
+) -> (f32, f32) {
+    let header_len = label.chars().count() + type_name.map_or(0, |t| t.chars().count() + 3);
+    let text_len = header_len.max(stereotype.chars().count());
+    let min_w = if type_name.is_some() || !ports.is_empty() {
+        170.0
+    } else {
+        130.0
+    };
+    let width = (text_len as f32 * 7.8 + 34.0).clamp(min_w, 420.0);
+    let in_count = ports
+        .iter()
+        .filter(|p| p.direction.effective_direction(p.is_conjugated) != PortDirection::Out)
+        .count();
+    let out_count = ports
+        .iter()
+        .filter(|p| p.direction.effective_direction(p.is_conjugated) == PortDirection::Out)
+        .count();
+    let max_side = in_count.max(out_count);
+    let pin_h = if max_side > 0 {
+        44.0 + (max_side as f32) * 22.0
+    } else {
+        48.0
+    };
+    let height = if has_children { 86.0 } else { pin_h.max(48.0) };
+    (width, height)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn collect_action_nodes_recursive(
+    graph: &DefinitionGraph,
     node: &ActionNode,
     parent: Option<&InstancePath>,
+    visible_scopes: &mut std::collections::BTreeSet<ElementId>,
+    path_by_scope_name: &mut BTreeMap<(ElementId, String), InstancePath>,
     path_by_name: &mut BTreeMap<String, InstancePath>,
     input: &mut LayoutInput,
     meta: &mut BTreeMap<String, NodeMeta>,
@@ -3766,9 +3870,44 @@ fn collect_action_nodes_recursive(
         Some(p) => p.push(node.id.clone()),
         None => InstancePath::root(node.id.clone()),
     };
+    let type_name = node.type_def.as_ref().map(|id| id.short_name().to_string());
+    let stereotype = match (node.kind, node.is_def) {
+        (ActionNodeKind::Action, true) => "«action def»".to_string(),
+        (ActionNodeKind::Action, false) => "«action»".to_string(),
+        _ => format!("«{:?}»", node.kind),
+    };
+    let effective_params: Vec<PortUsage> = if node.kind != ActionNodeKind::Action {
+        Vec::new()
+    } else if !node.params.is_empty() {
+        node.params.clone()
+    } else if let Some(ref td) = node.type_def {
+        graph
+            .resolve_action(td)
+            .map(|def| def.params.clone())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let ports: Vec<LayoutPortSpec> = effective_params
+        .iter()
+        .map(|p| LayoutPortSpec {
+            name: p.name.clone(),
+            direction: p.direction,
+            is_conjugated: p.is_conjugated,
+            type_label: p.port_def.as_ref().map(|d| d.short_name().to_string()),
+            span: p.span.clone(),
+        })
+        .collect();
+
     let (shape, width, height) = match node.kind {
         ActionNodeKind::Action => {
-            let (w, h) = fit_labeled_box_size("«action» ", &node.name, !node.children.is_empty(), 130.0);
+            let (w, h) = fit_action_box_size(
+                &node.name,
+                type_name.as_deref(),
+                &stereotype,
+                &ports,
+                !node.children.is_empty(),
+            );
             (NodeShape::ActionBox, w, h)
         }
         ActionNodeKind::Start => (NodeShape::StartCircle, 26.0, 26.0),
@@ -3778,13 +3917,19 @@ fn collect_action_nodes_recursive(
         ActionNodeKind::Merge => (NodeShape::MergeDiamond, 34.0, 34.0),
     };
 
+    visible_scopes.insert(node.id.clone());
+    if let Some(owner_id) = parent.and_then(|p| p.0.last()) {
+        path_by_scope_name.insert((owner_id.clone(), node.name.clone()), path.clone());
+    } else {
+        path_by_scope_name.insert((node.id.clone(), node.name.clone()), path.clone());
+    }
     path_by_name.insert(node.name.clone(), path.clone());
     meta.insert(
         path.canonical_key(),
         NodeMeta {
-            is_def: false,
-            type_name: None,
-            type_def: Some(node.id.clone()),
+            is_def: node.is_def,
+            type_name,
+            type_def: node.type_def.clone().or_else(|| Some(node.id.clone())),
             specializes: None,
             multiplicity: None,
             source_file: node.span.file.clone(),
@@ -3792,7 +3937,7 @@ fn collect_action_nodes_recursive(
             attributes: vec![],
             short_id: None,
             doc: node.doc.clone(),
-            stereotype: format!("«{:?}»", node.kind),
+            stereotype,
         },
     );
     input.nodes.push(LayoutNodeSpec {
@@ -3802,12 +3947,21 @@ fn collect_action_nodes_recursive(
         shape,
         width,
         height,
-        ports: vec![],
+        ports,
         span: node.span.clone(),
     });
 
     for child in &node.children {
-        collect_action_nodes_recursive(child, Some(&path), path_by_name, input, meta);
+        collect_action_nodes_recursive(
+            graph,
+            child,
+            Some(&path),
+            visible_scopes,
+            path_by_scope_name,
+            path_by_name,
+            input,
+            meta,
+        );
     }
 }
 
@@ -3840,12 +3994,21 @@ fn build_state_transition_layout(
     }
 
     for (idx, tr) in graph.transitions.iter().enumerate() {
-        if tr.source == "start" && !path_by_name.contains_key("start") {
-            let p = InstancePath::root(tr.owner_scope.child("start"));
-            path_by_name.insert("start".to_string(), p.clone());
+        let start_key = format!("{}::start", tr.owner_scope);
+        if tr.source == "start"
+            && path_by_name.contains_key(&tr.target)
+            && !path_by_name.contains_key(&start_key)
+        {
+            let parent = path_by_name.get(tr.owner_scope.short_name()).cloned();
+            let start_id = tr.owner_scope.child("start");
+            let p = match &parent {
+                Some(parent_path) => parent_path.push(start_id),
+                None => InstancePath::root(start_id),
+            };
+            path_by_name.insert(start_key.clone(), p.clone());
             input.nodes.push(LayoutNodeSpec {
                 path: p.clone(),
-                parent: path_by_name.get(tr.owner_scope.short_name()).cloned(),
+                parent,
                 label: "start".to_string(),
                 shape: NodeShape::StartCircle,
                 width: 26.0,
@@ -3871,8 +4034,13 @@ fn build_state_transition_layout(
             );
         }
 
+        let src_lookup = if tr.source == "start" {
+            start_key.as_str()
+        } else {
+            tr.source.as_str()
+        };
         if let (Some(src), Some(dst)) = (
-            path_by_name.get(&tr.source),
+            path_by_name.get(src_lookup),
             path_by_name.get(&tr.target),
         ) {
             let mut label_parts = Vec::new();
@@ -3882,6 +4050,11 @@ fn build_state_transition_layout(
             if let Some(ref eff) = tr.effect {
                 label_parts.push(format!("/ {eff}"));
             }
+            let edge_label = if !label_parts.is_empty() {
+                Some(label_parts.join(" "))
+            } else {
+                tr.name.clone()
+            };
             input.edges.push(LayoutEdgeSpec {
                 id: format!("{}#{idx}", tr.id),
                 source_node: src.clone(),
@@ -3889,11 +4062,7 @@ fn build_state_transition_layout(
                 target_node: dst.clone(),
                 target_port: None,
                 kind: RelationshipKind::Transition,
-                label: if label_parts.is_empty() {
-                    None
-                } else {
-                    Some(label_parts.join(" "))
-                },
+                label: edge_label,
                 guard: tr.guard.clone(),
                 span: tr.span.clone(),
             });
@@ -3949,7 +4118,10 @@ fn collect_state_nodes_recursive(
     }
 }
 
-fn collect_instantiated_part_defs(graph: &DefinitionGraph) -> BTreeSet<ElementId> {
+fn collect_instantiated_part_defs(
+    graph: &DefinitionGraph,
+    filter: &ViewFilter,
+) -> BTreeSet<ElementId> {
     fn visit_usage(
         graph: &DefinitionGraph,
         u: &syssur_model::PartUsage,
@@ -3968,11 +4140,17 @@ fn collect_instantiated_part_defs(graph: &DefinitionGraph) -> BTreeSet<ElementId
 
     let mut out = BTreeSet::new();
     for pd in graph.part_defs.values() {
+        if !filter.matches_element(&pd.id) {
+            continue;
+        }
         for u in &pd.parts {
             visit_usage(graph, u, &mut out);
         }
     }
     for u in graph.top_level_parts.values() {
+        if !filter.matches_element(&u.id) {
+            continue;
+        }
         visit_usage(graph, u, &mut out);
     }
     out
@@ -3996,7 +4174,7 @@ fn populate_filtered_structural_nodes(
         .filter(|id| filter.matches_element(id))
         .cloned()
         .collect();
-    let instantiated_types = collect_instantiated_part_defs(graph);
+    let instantiated_types = collect_instantiated_part_defs(graph, filter);
 
     let max_depth = if view_kind == ViewKind::Interconnection {
         4
@@ -4076,46 +4254,15 @@ fn populate_filtered_structural_nodes(
             break;
         }
         if filter.matches_element(&req.id) {
-            let path = InstancePath::root(req.id.clone());
-            if expanded_keys.insert(path.canonical_key()) {
-                extra_count += 1;
-                let (width, height) = fit_requirement_card_size(
-                    "«requirement»",
-                    req.short_id.as_deref(),
-                    &req.name,
-                    req.doc.as_deref(),
-                );
-                input.nodes.push(LayoutNodeSpec {
-                    path: path.clone(),
-                    parent: None,
-                    label: req.name.clone(),
-                    shape: NodeShape::RequirementCard,
-                    width,
-                    height,
-                    ports: vec![],
-                    span: req.span.clone(),
-                });
-                meta.insert(
-                    path.canonical_key(),
-                    NodeMeta {
-                        is_def: !req.is_usage,
-                        type_name: None,
-                        type_def: Some(req.id.clone()),
-                        specializes: None,
-                        multiplicity: None,
-                        source_file: req.span.file.clone(),
-                        origin: FeatureOrigin::Owned,
-                        attributes: vec![],
-                        short_id: req.short_id.clone(),
-                        doc: req.doc.clone(),
-                        stereotype: if req.is_usage {
-                            "«requirement»".to_string()
-                        } else {
-                            "«requirement def»".to_string()
-                        },
-                    },
-                );
-            }
+            push_requirement_node_recursive(
+                graph,
+                req,
+                expanded_keys,
+                &mut extra_count,
+                max_extras,
+                input,
+                meta,
+            );
         }
     }
 
@@ -4213,6 +4360,8 @@ fn populate_filtered_structural_nodes(
                 stereo,
                 elem.short_id.as_deref(),
                 &elem.name,
+                type_name.as_deref(),
+                &[],
                 elem.doc.as_deref(),
             )
         } else {
@@ -4356,26 +4505,92 @@ fn build_structural_layout(
     }
 
     if view_kind == ViewKind::General {
+        let mut related_by_target: BTreeMap<String, InstancePath> = BTreeMap::new();
         for (idx, link) in graph.trace_links.iter().enumerate() {
             if link.kind != RelationshipKind::Satisfy && link.kind != RelationshipKind::Verify {
                 continue;
             }
             let target_leaf = link.target.rsplit('.').next().unwrap_or(&link.target);
-            let req_short = link.requirement.short_name();
-            if let (Some(part_node), Some(req_node)) = (
-                visible_by_short.get(target_leaf),
-                visible_by_short.get(req_short),
-            ) {
+            if let Some(req_node) = resolve_visible_requirement_path(&link.requirement, &input.nodes)
+            {
+                let part_node = input
+                    .nodes
+                    .iter()
+                    .find(|n| n.shape != NodeShape::RequirementCard && n.label == target_leaf)
+                    .map(|n| n.path.clone())
+                    .or_else(|| related_by_target.get(&link.target).cloned())
+                    .unwrap_or_else(|| {
+                        let resolved = resolve_trace_target_context(
+                            graph,
+                            &link.target,
+                            link.kind,
+                            &link.span.file,
+                        );
+                        let path = InstancePath::root(resolved.element_id.clone());
+                        if expanded_keys.insert(path.canonical_key()) {
+                            let (width, height) = if resolved.shape == NodeShape::PartBlock {
+                                fit_part_block_size(
+                                    &resolved.stereotype,
+                                    &resolved.label,
+                                    resolved.type_name.as_deref(),
+                                    None,
+                                    None,
+                                    &FeatureOrigin::Owned,
+                                    &resolved.attributes,
+                                    0,
+                                )
+                            } else {
+                                fit_generic_element_size(
+                                    &resolved.stereotype,
+                                    &resolved.label,
+                                    resolved.type_name.as_deref(),
+                                    resolved.shape,
+                                    false,
+                                )
+                            };
+                            input.nodes.push(LayoutNodeSpec {
+                                path: path.clone(),
+                                parent: None,
+                                label: resolved.label,
+                                shape: resolved.shape,
+                                width,
+                                height,
+                                ports: vec![],
+                                span: resolved.span,
+                            });
+                            meta.insert(
+                                path.canonical_key(),
+                                NodeMeta {
+                                    is_def: resolved.is_def,
+                                    type_name: resolved.type_name,
+                                    type_def: resolved.type_def.or(Some(resolved.element_id)),
+                                    specializes: None,
+                                    multiplicity: None,
+                                    source_file: resolved.source_file,
+                                    origin: FeatureOrigin::Owned,
+                                    attributes: resolved.attributes,
+                                    short_id: None,
+                                    doc: None,
+                                    stereotype: resolved.stereotype,
+                                },
+                            );
+                        }
+                        related_by_target.insert(link.target.clone(), path.clone());
+                        path
+                    });
+
                 let lbl = if link.kind == RelationshipKind::Verify {
                     "«verify»"
+                } else if link.is_asserted {
+                    "«assert satisfy»"
                 } else {
                     "«satisfy»"
                 };
                 input.edges.push(LayoutEdgeSpec {
                     id: format!("trace#{idx}"),
-                    source_node: part_node.clone(),
+                    source_node: part_node,
                     source_port: None,
-                    target_node: req_node.clone(),
+                    target_node: req_node,
                     target_port: None,
                     kind: link.kind,
                     label: Some(lbl.to_string()),
@@ -4511,21 +4726,417 @@ fn fit_part_block_size(
     (width, height)
 }
 
+struct ResolvedTraceContext {
+    element_id: ElementId,
+    label: String,
+    type_name: Option<String>,
+    type_def: Option<ElementId>,
+    attributes: Vec<String>,
+    is_def: bool,
+    shape: NodeShape,
+    stereotype: String,
+    source_file: String,
+    span: syssur_model::Span,
+}
+
+fn resolve_trace_target_context(
+    graph: &DefinitionGraph,
+    raw_target: &str,
+    kind: RelationshipKind,
+    fallback_file: &str,
+) -> ResolvedTraceContext {
+    let raw_trimmed = raw_target.trim();
+    let segments: Vec<&str> = raw_trimmed.split('.').filter(|s| !s.is_empty()).collect();
+    let head = segments.first().copied().unwrap_or(raw_trimmed);
+    let head_short = head.rsplit("::").next().unwrap_or(head);
+
+    let default_shape = if kind == RelationshipKind::Verify {
+        NodeShape::CaseOval
+    } else {
+        NodeShape::PartBlock
+    };
+    let default_stereo = if kind == RelationshipKind::Verify {
+        "«verification»".to_string()
+    } else {
+        "«part»".to_string()
+    };
+
+    if kind == RelationshipKind::Verify {
+        let elem_opt = graph
+            .generic_elements
+            .get(&ElementId::new(raw_trimmed))
+            .or_else(|| {
+                graph
+                    .generic_elements
+                    .values()
+                    .find(|e| e.name == head_short || e.id.short_name() == head_short)
+            });
+        if let Some(elem) = elem_opt {
+            return ResolvedTraceContext {
+                element_id: elem.id.clone(),
+                label: elem.name.clone(),
+                type_name: elem.type_ref.as_ref().map(|t| t.short_name().to_string()),
+                type_def: elem.type_ref.clone(),
+                attributes: vec![],
+                is_def: elem.is_def,
+                shape: NodeShape::CaseOval,
+                stereotype: "«verification»".to_string(),
+                source_file: elem.span.file.clone(),
+                span: elem.span.clone(),
+            };
+        }
+    }
+
+    let head_usage = graph
+        .top_level_parts
+        .get(&ElementId::new(head))
+        .or_else(|| {
+            graph
+                .top_level_parts
+                .values()
+                .find(|u| u.name == head_short || u.id.short_name() == head_short)
+        });
+
+    let mut cur_usage = head_usage.cloned();
+    let mut cur_def = head_usage
+        .and_then(|u| u.type_def.as_ref())
+        .and_then(|td| graph.resolve_part_def(td))
+        .or_else(|| graph.resolve_part_def(&ElementId::new(head)));
+
+    if segments.len() > 1 {
+        for seg in &segments[1..] {
+            let next = cur_usage
+                .as_ref()
+                .and_then(|u| u.nested_parts.iter().find(|c| c.name == *seg))
+                .cloned()
+                .or_else(|| {
+                    cur_def.as_ref().and_then(|pd| {
+                        graph
+                            .effective_parts_for_def(&pd.id)
+                            .into_iter()
+                            .find(|c| c.name == *seg)
+                    })
+                });
+            if let Some(found) = next {
+                cur_def = found
+                    .type_def
+                    .as_ref()
+                    .and_then(|td| graph.resolve_part_def(td));
+                cur_usage = Some(found);
+            } else {
+                cur_usage = None;
+                cur_def = None;
+                break;
+            }
+        }
+    }
+
+    let label = if segments.len() >= 3 {
+        segments[1..].join(".")
+    } else if segments.len() == 2 {
+        segments.join(".")
+    } else {
+        head_short.to_string()
+    };
+
+    if let Some(u) = cur_usage {
+        let resolved_def = u
+            .type_def
+            .as_ref()
+            .and_then(|td| graph.resolve_part_def(td));
+        let type_name = u.type_def.as_ref().map(|d| d.short_name().to_string());
+        let type_def = resolved_def
+            .map(|pd| pd.id.clone())
+            .or_else(|| u.type_def.clone());
+        let mut attrs: Vec<String> = Vec::new();
+        if let Some(ref td) = type_def {
+            for a in graph.effective_attributes_for_def(td) {
+                attrs.push(a.display_label());
+            }
+        }
+        for a in &u.attributes {
+            let lbl = a.display_label();
+            if !attrs.contains(&lbl) {
+                attrs.push(lbl);
+            }
+        }
+        let source_file = resolved_def
+            .map(|pd| pd.span.file.clone())
+            .unwrap_or_else(|| u.span.file.clone());
+        let span = u.span.clone();
+        return ResolvedTraceContext {
+            element_id: u.id,
+            label,
+            type_name,
+            type_def,
+            attributes: attrs,
+            is_def: false,
+            shape: default_shape,
+            stereotype: default_stereo,
+            source_file,
+            span,
+        };
+    }
+
+    if let Some(pd) = cur_def {
+        let attrs = graph
+            .effective_attributes_for_def(&pd.id)
+            .into_iter()
+            .map(|a| a.display_label())
+            .collect();
+        return ResolvedTraceContext {
+            element_id: pd.id.clone(),
+            label: pd.name.clone(),
+            type_name: None,
+            type_def: Some(pd.id.clone()),
+            attributes: attrs,
+            is_def: kind != RelationshipKind::Verify,
+            shape: default_shape,
+            stereotype: if kind == RelationshipKind::Verify {
+                default_stereo
+            } else {
+                "«part def»".to_string()
+            },
+            source_file: pd.span.file.clone(),
+            span: pd.span.clone(),
+        };
+    }
+
+    ResolvedTraceContext {
+        element_id: ElementId::new(raw_trimmed),
+        label,
+        type_name: None,
+        type_def: None,
+        attributes: vec![],
+        is_def: false,
+        shape: default_shape,
+        stereotype: default_stereo,
+        source_file: fallback_file.to_string(),
+        span: syssur_model::Span::new(fallback_file, 0, 0),
+    }
+}
+
+fn push_requirement_node_recursive(
+    graph: &DefinitionGraph,
+    req: &syssur_model::RequirementNode,
+    expanded_keys: &mut BTreeSet<String>,
+    extra_count: &mut usize,
+    max_extras: usize,
+    input: &mut LayoutInput,
+    meta: &mut BTreeMap<String, NodeMeta>,
+) -> InstancePath {
+    let path = InstancePath::root(req.id.clone());
+    if *extra_count >= max_extras {
+        return path;
+    }
+    if expanded_keys.insert(path.canonical_key()) {
+        *extra_count += 1;
+        let stereo = if req.is_usage {
+            "«requirement»"
+        } else {
+            "«requirement def»"
+        };
+        let type_def_node = req
+            .type_def
+            .as_ref()
+            .and_then(|td| graph.resolve_requirement(td));
+        let type_name = req.type_def.as_ref().map(|d| d.short_name().to_string());
+        let eff_short_id = req
+            .short_id
+            .clone()
+            .or_else(|| type_def_node.and_then(|d| d.short_id.clone()));
+        let eff_doc = req
+            .doc
+            .clone()
+            .or_else(|| type_def_node.and_then(|d| d.doc.clone()));
+
+        let mut display_attrs = Vec::new();
+        let subj_name = req
+            .subject
+            .as_ref()
+            .map(|s| s.name.as_str())
+            .or_else(|| type_def_node.and_then(|d| d.subject.as_ref().map(|s| s.name.as_str())));
+        let subj_type = req
+            .subject
+            .as_ref()
+            .and_then(|s| s.type_def.as_ref())
+            .or_else(|| {
+                type_def_node.and_then(|d| d.subject.as_ref().and_then(|s| s.type_def.as_ref()))
+            });
+        let subj_val = req
+            .subject
+            .as_ref()
+            .and_then(|s| s.value_expr.as_deref())
+            .or_else(|| {
+                type_def_node.and_then(|d| d.subject.as_ref().and_then(|s| s.value_expr.as_deref()))
+            });
+        if let Some(sname) = subj_name {
+            if let Some(st) = subj_type {
+                display_attrs.push(format!("subject {sname} : {}", st.short_name()));
+            } else if let Some(sv) = subj_val {
+                display_attrs.push(format!("subject {sname} = {sv}"));
+            } else {
+                display_attrs.push(format!("subject {sname}"));
+            }
+        }
+        let mut eff_attrs = type_def_node
+            .map(|d| d.attributes.clone())
+            .unwrap_or_default();
+        for local in &req.attributes {
+            if let Some(slot) = eff_attrs.iter_mut().find(|a| a.name == local.name) {
+                *slot = local.clone();
+            } else {
+                eff_attrs.push(local.clone());
+            }
+        }
+        for attr in eff_attrs {
+            display_attrs.push(attr.display_label());
+        }
+
+        let (width, height) = fit_requirement_card_size(
+            stereo,
+            eff_short_id.as_deref(),
+            &req.name,
+            type_name.as_deref(),
+            &display_attrs,
+            eff_doc.as_deref(),
+        );
+        input.nodes.push(LayoutNodeSpec {
+            path: path.clone(),
+            parent: None,
+            label: req.name.clone(),
+            shape: NodeShape::RequirementCard,
+            width,
+            height,
+            ports: vec![],
+            span: req.span.clone(),
+        });
+        meta.insert(
+            path.canonical_key(),
+            NodeMeta {
+                is_def: !req.is_usage,
+                type_name,
+                type_def: req.type_def.clone().or_else(|| Some(req.id.clone())),
+                specializes: None,
+                multiplicity: None,
+                source_file: req.span.file.clone(),
+                origin: FeatureOrigin::Owned,
+                attributes: display_attrs,
+                short_id: eff_short_id,
+                doc: eff_doc,
+                stereotype: stereo.to_string(),
+            },
+        );
+
+        for (idx, child_id) in req.children.iter().enumerate() {
+            if *extra_count >= max_extras {
+                break;
+            }
+            if let Some(child_req) = graph.requirements.get(child_id) {
+                let child_path = push_requirement_node_recursive(
+                    graph,
+                    child_req,
+                    expanded_keys,
+                    extra_count,
+                    max_extras,
+                    input,
+                    meta,
+                );
+                input.edges.push(LayoutEdgeSpec {
+                    id: format!("req_comp#{}#{idx}", child_id),
+                    source_node: path.clone(),
+                    source_port: None,
+                    target_node: child_path,
+                    target_port: None,
+                    kind: RelationshipKind::Composition,
+                    label: None,
+                    guard: None,
+                    span: child_req.span.clone(),
+                });
+            }
+        }
+    }
+    path
+}
+
+fn resolve_visible_requirement_path(
+    req_ref: &ElementId,
+    nodes: &[LayoutNodeSpec],
+) -> Option<InstancePath> {
+    let normalized = req_ref.as_str().replace('.', "::");
+    let short = normalized.rsplit("::").next().unwrap_or(&normalized);
+    if let Some(n) = nodes.iter().find(|n| {
+        n.shape == NodeShape::RequirementCard
+            && n.path
+                .0
+                .last()
+                .is_some_and(|id| id.as_str() == normalized)
+    }) {
+        return Some(n.path.clone());
+    }
+    if let Some(n) = nodes.iter().find(|n| {
+        n.shape == NodeShape::RequirementCard
+            && n.path
+                .0
+                .last()
+                .is_some_and(|id| id.as_str().ends_with(&format!("::{normalized}")))
+    }) {
+        return Some(n.path.clone());
+    }
+    let mut matches = nodes.iter().filter(|n| {
+        n.shape == NodeShape::RequirementCard
+            && (n.label == short || n.path.0.last().is_some_and(|id| id.short_name() == short))
+    });
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(first.path.clone())
+}
+
 fn fit_requirement_card_size(
     stereo: &str,
     short_id: Option<&str>,
     label: &str,
+    type_name: Option<&str>,
+    attrs: &[String],
     doc: Option<&str>,
 ) -> (f32, f32) {
     let stereo_w = stereo.chars().count() as f32 * 7.0 + 20.0;
-    let title_len = short_id.map_or(0, |s| s.chars().count() + 3) + label.chars().count();
-    let title_w = title_len as f32 * 8.2 + 22.0;
+    let title_len = short_id.map_or(0, |s| s.chars().count() + 3)
+        + label.chars().count()
+        + type_name.map_or(0, |t| t.chars().count() + 3);
+    let title_w = title_len as f32 * 8.2 + 24.0;
     let doc_w = doc.map_or(0.0, |d| {
-        let len = d.chars().count();
-        (len.min(46) + usize::from(len > 46) * 3) as f32 * 6.5 + 22.0
+        let len = d.chars().count().min(38);
+        len as f32 * 6.4 + 22.0
     });
-    let width = stereo_w.max(title_w).max(doc_w).clamp(150.0, 440.0);
-    let height = if doc.is_some() { 64.0 } else { 44.0 };
+    let attr_w = attrs
+        .iter()
+        .map(|a| a.chars().count() as f32 * 6.5 + 20.0)
+        .fold(0.0f32, f32::max);
+    let width = stereo_w
+        .max(title_w)
+        .max(doc_w)
+        .max(attr_w)
+        .clamp(210.0, 360.0);
+    let attr_h = if attrs.is_empty() {
+        0.0
+    } else {
+        attrs.len() as f32 * 14.5 + 6.0
+    };
+    let doc_h = if let Some(d) = doc {
+        let chars_per_line = ((width - 20.0) / 6.1).max(20.0);
+        let lines = ((d.chars().count() as f32 / chars_per_line).ceil() as usize).clamp(1, 5);
+        lines as f32 * 14.5 + 8.0
+    } else {
+        0.0
+    };
+    let height = if attr_h > 0.0 || doc_h > 0.0 {
+        42.0 + attr_h + doc_h + 6.0
+    } else {
+        44.0
+    };
     (width, height)
 }
 
@@ -5340,6 +5951,645 @@ mod tests {
         assert!(
             r_battery.y >= r_energy.y + 38.0 && r_energy.y >= r_root.y + 38.0,
             "3-level containers must enclose children with header clearance"
+        );
+    }
+
+    #[test]
+    fn state_transition_view_renders_initial_node_and_transition_labels() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "behavior.sysml".into(),
+            r#"package RoverBehavior {
+    state def OperatingMode {
+        entry; then docked;
+        state docked;
+        state patrolling;
+        state inspecting;
+        state returning;
+        state charging;
+        state safeStop;
+        transition dispatch first docked then patrolling;
+        transition targetFound first patrolling then inspecting;
+        transition inspectionComplete first inspecting then patrolling;
+        transition lowReserve first patrolling then returning;
+        transition dockReached first returning then charging;
+        transition chargeComplete first charging then docked;
+        transition obstacleDetected first patrolling then safeStop;
+        transition pathClear first safeStop then patrolling;
+    }
+}"#
+            .into(),
+        );
+        files.insert(
+            "views.sysml".into(),
+            r#"package RoverViews {
+    private import StandardViewDefinitions::*;
+    view lifecycle : StateTransitionView { expose RoverBehavior::OperatingMode; }
+}"#
+            .into(),
+        );
+
+        let parsed = SysmlEngine::parse_workspace(&files);
+        let (base_input, _) = build_layout_input_for_view(
+            &parsed.graph,
+            &ViewScope::SysmlView(ElementId::new("RoverViews::lifecycle")),
+            ViewKind::StateTransition,
+            LayoutDirection::TopToBottom,
+        );
+        let layout = syssur_layout::compute_deterministic_layout(&base_input);
+
+        let start_spec = base_input
+            .nodes
+            .iter()
+            .find(|n| n.shape == NodeShape::StartCircle)
+            .expect("StartCircle initial pseudo-state");
+        assert!(
+            start_spec
+                .parent
+                .as_ref()
+                .is_some_and(|p| p.canonical_key().ends_with("OperatingMode")),
+            "StartCircle should be nested under OperatingMode container"
+        );
+        let r_start = layout.nodes[&start_spec.path.canonical_key()].rect;
+        let r_mode = layout.nodes["RoverBehavior::OperatingMode"].rect;
+        assert!(
+            r_start.y >= r_mode.y + 38.0 && r_start.x >= r_mode.x + 16.0,
+            "StartCircle must be enclosed inside OperatingMode container: start={r_start:?}, mode={r_mode:?}"
+        );
+
+        assert_eq!(
+            layout.edges.len(),
+            9,
+            "expected 1 initial edge + 8 transitions, got {}",
+            layout.edges.len()
+        );
+        assert!(
+            layout
+                .edges
+                .iter()
+                .any(|e| e.label.as_deref() == Some("dispatch")),
+            "expected named transition label `dispatch` on routed edge"
+        );
+    }
+
+    #[test]
+    fn requirements_view_synthesizes_related_satisfying_parts_and_edges() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "components.sysml".into(),
+            r#"package RoverComponents {
+    private import ScalarValues::*;
+    part def Battery {
+        attribute reservePercent : Real default = 20.0;
+    }
+    part def Drive {
+        attribute maximumSpeedMps : Real default = 1.5;
+    }
+    part def Controller {
+        attribute obstacleStopDistanceM : Real default = 0.8;
+    }
+    part def Camera {
+        attribute resolutionMP : Real default = 12.0;
+    }
+}"#
+            .into(),
+        );
+        files.insert(
+            "system.sysml".into(),
+            r#"package RoverSystem {
+    private import RoverComponents::*;
+    part def InspectionRover {
+        part energy { part battery : Battery; }
+        part mobility { part leftDrive : Drive; }
+        part autonomy { part controller : Controller; }
+        part inspection { part camera : Camera; }
+    }
+    part rover : InspectionRover;
+}"#
+            .into(),
+        );
+        files.insert(
+            "requirements.sysml".into(),
+            r#"package RoverRequirements {
+    private import RoverComponents::*;
+    requirement def EnergyReserve { doc /* Keep at least 20 percent battery reserve for the return journey. */ }
+    requirement def SafeSpeed { doc /* Limit the left drive nominal indoor speed to 1.5 m/s. */ }
+    requirement def ObstacleClearance { doc /* Stop at least 0.8 m before a detected obstacle. */ }
+    requirement def InspectionQuality { doc /* Capture inspection images at a resolution of at least 12 MP. */ }
+    requirement <'RVR-RESERVE'> reserve : EnergyReserve {
+        doc /* Keep at least 20 percent battery reserve for the return journey. */
+    }
+    requirement <'RVR-SPEED'> speed : SafeSpeed {
+        doc /* Limit the left drive nominal indoor speed to 1.5 m/s. */
+    }
+    requirement <'RVR-CLEAR'> clearance : ObstacleClearance {
+        doc /* Stop at least 0.8 m before a detected obstacle. */
+    }
+    requirement <'RVR-IMAGE'> imaging : InspectionQuality {
+        doc /* Capture inspection images at a resolution of at least 12 MP. */
+    }
+    assert satisfy reserve by RoverSystem::rover.energy.battery;
+    assert satisfy speed by RoverSystem::rover.mobility.leftDrive;
+    assert satisfy clearance by RoverSystem::rover.autonomy.controller;
+    assert satisfy imaging by RoverSystem::rover.inspection.camera;
+}"#
+            .into(),
+        );
+        files.insert(
+            "views.sysml".into(),
+            r#"package RoverViews {
+    private import StandardViewDefinitions::*;
+    view requirements : GeneralView {
+        filter @SysML::RequirementDefinition or @SysML::RequirementUsage;
+        expose RoverRequirements::reserve;
+        expose RoverRequirements::speed;
+        expose RoverRequirements::clearance;
+        expose RoverRequirements::imaging;
+    }
+}"#
+            .into(),
+        );
+
+        let parsed = SysmlEngine::parse_workspace(&files);
+        let (base_input, meta) = build_layout_input_for_view(
+            &parsed.graph,
+            &ViewScope::SysmlView(ElementId::new("RoverViews::requirements")),
+            ViewKind::General,
+            LayoutDirection::TopToBottom,
+        );
+        let layout = syssur_layout::compute_deterministic_layout(&base_input);
+
+        assert_eq!(
+            layout.nodes.len(),
+            8,
+            "expected 4 exposed requirements + 4 related satisfying part blocks, got {:?}",
+            layout.nodes.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(layout.edges.len(), 4, "expected 4 satisfy edges");
+        assert!(
+            layout
+                .edges
+                .iter()
+                .all(|e| e.kind == RelationshipKind::Satisfy
+                    && e.label.as_deref() == Some("«assert satisfy»")),
+            "expected «assert satisfy» edges, got {:?}",
+            layout.edges
+        );
+
+        let reserve_meta = meta
+            .get("RoverRequirements::reserve")
+            .expect("reserve metadata");
+        assert_eq!(reserve_meta.type_name.as_deref(), Some("EnergyReserve"));
+        let reserve_rect = layout.nodes["RoverRequirements::reserve"].rect;
+        assert!(
+            reserve_rect.h > 64.0,
+            "wrapped requirement card must grow taller than 64px, got {}",
+            reserve_rect.h
+        );
+
+        let (_, bat_meta) = meta
+            .iter()
+            .find(|(k, _)| k.contains("battery"))
+            .expect("synthesized battery context block");
+        assert_eq!(bat_meta.type_name.as_deref(), Some("Battery"));
+    }
+
+    #[test]
+    fn definitions_view_shows_all_exposed_part_defs_even_when_instantiated_elsewhere() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "components.sysml".into(),
+            r#"package RoverComponents {
+    private import ScalarValues::*;
+    part def Battery { attribute capacityWh : Real default = 480.0; }
+    part def Distribution;
+    part def Actuator;
+    part def Sensor;
+    part def Drive :> Actuator { attribute maximumSpeedMps : Real default = 1.5; }
+    part def Controller { attribute obstacleStopDistanceM : Real default = 0.8; }
+    part def Lidar :> Sensor { attribute rangeM : Real default = 12.0; }
+    part def Camera :> Sensor { attribute resolutionMP : Real default = 12.0; }
+    part def Radio { attribute rangeM : Real default = 300.0; }
+}"#
+            .into(),
+        );
+        files.insert(
+            "system.sysml".into(),
+            r#"package RoverSystem {
+    private import RoverComponents::*;
+    part def InspectionRover {
+        part energy {
+            part battery : Battery;
+            part distribution : Distribution;
+        }
+        part mobility {
+            part leftDrive : Drive;
+            part rightDrive : Drive;
+        }
+        part autonomy {
+            part controller : Controller;
+            part lidar : Lidar;
+        }
+        part inspection {
+            part camera : Camera;
+            part radio : Radio;
+        }
+    }
+}"#
+            .into(),
+        );
+        files.insert(
+            "views.sysml".into(),
+            r#"package RoverViews {
+    private import StandardViewDefinitions::*;
+    view definitions : GeneralView {
+        filter @SysML::PartDefinition or @SysML::PartUsage;
+        expose RoverComponents::**;
+    }
+}"#
+            .into(),
+        );
+
+        let parsed = SysmlEngine::parse_workspace(&files);
+        let (base_input, _) = build_layout_input_for_view(
+            &parsed.graph,
+            &ViewScope::SysmlView(ElementId::new("RoverViews::definitions")),
+            ViewKind::General,
+            LayoutDirection::TopToBottom,
+        );
+        let layout = syssur_layout::compute_deterministic_layout(&base_input);
+
+        assert_eq!(
+            layout.nodes.len(),
+            9,
+            "expected all 9 RoverComponents part defs, got {:?}",
+            layout.nodes.keys().collect::<Vec<_>>()
+        );
+        let spec_edges = layout
+            .edges
+            .iter()
+            .filter(|e| e.kind == RelationshipKind::Specialization)
+            .count();
+        assert_eq!(
+            spec_edges, 3,
+            "expected 3 specialization edges (Drive->Actuator, Lidar->Sensor, Camera->Sensor)"
+        );
+    }
+
+    #[test]
+    fn air_compressor_overview_view_inherits_interconnection_kind_and_renders_parts_and_connections()
+    {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "types.sysml".into(),
+            r#"package CompressorTypes {
+    item def Power;
+    item def Air;
+    port def PowerOutlet { out item power : Power; }
+    port def AirOutlet { out item air : Air; }
+}"#
+            .into(),
+        );
+        files.insert(
+            "components.sysml".into(),
+            r#"package CompressorComponents {
+    private import ScalarValues::*;
+    private import CompressorTypes::*;
+    part def PowerSupply {
+        attribute ratedPower : Real default = 2200.0;
+        out port supply : PowerOutlet;
+    }
+    part def CompressorInterface {
+        in port power : ~PowerOutlet;
+        out port air : AirOutlet;
+    }
+    part def AirTool {
+        in port inlet : ~AirOutlet;
+    }
+    part def ServiceConsole;
+}"#
+            .into(),
+        );
+        files.insert(
+            "system.sysml".into(),
+            r#"package CompressorSystem {
+    private import CompressorComponents::*;
+    part def WorkshopContext {
+        part mains : PowerSupply;
+        part compressor : CompressorInterface;
+        part tool : AirTool;
+        part serviceConsole : ServiceConsole;
+        connection electricalSupply connect mains.supply to compressor.power;
+        connection usableAir connect compressor.air to tool.inlet;
+    }
+}"#
+            .into(),
+        );
+        files.insert(
+            "views.sysml".into(),
+            r#"package CompressorViews {
+    private import StandardViewDefinitions::*;
+    view def Structure :> InterconnectionView;
+    view overview : Structure { expose CompressorSystem::WorkshopContext; }
+}"#
+            .into(),
+        );
+
+        let parsed = SysmlEngine::parse_workspace(&files);
+        let overview = &parsed.graph.views[&ElementId::new("CompressorViews::overview")];
+        assert_eq!(
+            overview.kind,
+            ViewKind::Interconnection,
+            "view overview : Structure must inherit Interconnection from `view def Structure :> InterconnectionView`"
+        );
+
+        let (base_input, _) = build_layout_input_for_view(
+            &parsed.graph,
+            &ViewScope::SysmlView(overview.id.clone()),
+            overview.kind,
+            LayoutDirection::LeftToRight,
+        );
+        let layout = syssur_layout::compute_deterministic_layout(&base_input);
+
+        assert_eq!(
+            layout.nodes.len(),
+            5,
+            "expected WorkshopContext + 4 nested parts, got {:?}",
+            layout.nodes.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            layout.edges.len(),
+            2,
+            "expected electricalSupply and usableAir connections"
+        );
+    }
+
+    #[test]
+    fn action_flow_view_renders_action_types_pins_and_item_flows() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "behavior.sysml".into(),
+            r#"package CompressorBehavior {
+    item def PressureReading;
+    item def TemperatureReading;
+    item def ControlCommand;
+    action def SensePressure {
+        out item reading : PressureReading;
+    }
+    action def SenseTemperature {
+        out item reading : TemperatureReading;
+    }
+    action def ControlMotor {
+        in item reading : PressureReading;
+        in item temperature : TemperatureReading;
+        out item command : ControlCommand;
+    }
+    action def CompressAir {
+        action sense : SensePressure;
+        action temperature : SenseTemperature;
+        action control : ControlMotor;
+        first start then sense;
+        first sense then temperature;
+        first temperature then control;
+        first control then done;
+        flow from sense.reading to control.reading;
+        flow from temperature.reading to control.temperature;
+    }
+}"#
+            .into(),
+        );
+        files.insert(
+            "views.sysml".into(),
+            r#"package CompressorViews {
+    private import StandardViewDefinitions::*;
+    view actions : ActionFlowView { expose CompressorBehavior::CompressAir; }
+}"#
+            .into(),
+        );
+
+        let parsed = SysmlEngine::parse_workspace(&files);
+        let actions_view = &parsed.graph.views[&ElementId::new("CompressorViews::actions")];
+        let (base_input, meta) = build_layout_input_for_view(
+            &parsed.graph,
+            &ViewScope::SysmlView(actions_view.id.clone()),
+            actions_view.kind,
+            LayoutDirection::TopToBottom,
+        );
+        let layout = syssur_layout::compute_deterministic_layout(&base_input);
+
+        let compress_key = "CompressorBehavior::CompressAir";
+        assert!(meta[compress_key].is_def);
+        assert_eq!(meta[compress_key].stereotype, "«action def»");
+
+        let sense_key = "CompressorBehavior::CompressAir/CompressorBehavior::CompressAir::sense";
+        assert!(!meta[sense_key].is_def);
+        assert_eq!(meta[sense_key].type_name.as_deref(), Some("SensePressure"));
+        assert_eq!(layout.nodes[sense_key].ports.len(), 1);
+        assert_eq!(
+            layout.nodes[sense_key].ports[0].side,
+            syssur_layout::PortSide::Right
+        );
+
+        let control_key =
+            "CompressorBehavior::CompressAir/CompressorBehavior::CompressAir::control";
+        assert_eq!(meta[control_key].type_name.as_deref(), Some("ControlMotor"));
+        let control_ports = &layout.nodes[control_key].ports;
+        assert_eq!(control_ports.len(), 3);
+        assert_eq!(
+            control_ports
+                .iter()
+                .filter(|p| p.side == syssur_layout::PortSide::Left)
+                .count(),
+            2
+        );
+        assert_eq!(
+            control_ports
+                .iter()
+                .filter(|p| p.side == syssur_layout::PortSide::Right)
+                .count(),
+            1
+        );
+
+        let flow_edges: Vec<_> = layout
+            .edges
+            .iter()
+            .filter(|e| e.kind == RelationshipKind::Flow)
+            .collect();
+        assert_eq!(flow_edges.len(), 2);
+        assert!(flow_edges
+            .iter()
+            .any(|e| e.label.as_deref() == Some("reading to reading")));
+        assert!(flow_edges
+            .iter()
+            .any(|e| e.label.as_deref() == Some("reading to temperature")));
+    }
+
+    #[test]
+    fn air_compressor_requirements_view_shows_nested_reqs_attrs_and_trace_links() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "components.sysml".into(),
+            r#"package CompressorComponents {
+    private import ScalarValues::*;
+    part def Controller { attribute shutdownDuration : Real = 0.5; }
+    part def TemperatureSensor { attribute temperature : Real = 310.0; }
+    part def Tank { attribute volume : Real = 0.1; attribute pressure : Real = 700000.0; }
+    part def CheckValve { attribute deliveryPressure : Real = 650000.0; }
+    part def ReliefValve { attribute openingPressure : Real = 780000.0; }
+}"#
+            .into(),
+        );
+        files.insert(
+            "system.sysml".into(),
+            r#"package CompressorSystem {
+    private import CompressorComponents::*;
+    part def ElectricalAssembly { part controller : Controller; }
+    part def CoolingAssembly { part temperature : TemperatureSensor; }
+    part def PneumaticAssembly {
+        part tank : Tank;
+        part regulator : CheckValve;
+        part relief : ReliefValve;
+    }
+    part def Compressor {
+        part electrical : ElectricalAssembly;
+        part pneumatic : PneumaticAssembly;
+        part cooling : CoolingAssembly;
+    }
+    part def Workshop { part compressor : Compressor; }
+    part workshop : Workshop;
+}"#
+            .into(),
+        );
+        files.insert(
+            "requirements.sysml".into(),
+            r#"package CompressorRequirements {
+    private import ScalarValues::*;
+    private import CompressorComponents::*;
+    private import CompressorSystem::*;
+    requirement def <'COMP-001'> SafePressure {
+        doc /* Tank pressure shall not exceed 800000 Pa. */
+        subject tank : Tank;
+        attribute maximum : Real default = 800000.0;
+    }
+    requirement def <'COMP-002'> StorageCapacity {
+        doc /* The tank shall provide at least 0.05 cubic metres of storage. */
+        subject tank : Tank;
+        attribute minimum : Real default = 0.05;
+    }
+    requirement def <'COMP-003'> ThermalLimit {
+        doc /* Normal operation shall remain below 353.15 K. */
+        subject sensor : TemperatureSensor;
+        attribute maximum : Real default = 353.15;
+    }
+    requirement def <'COMP-004'> SafeShutdown {
+        doc /* The controller shall stop the motor within 1 s. */
+        subject controller : Controller;
+        attribute maximum : Real default = 1.0;
+    }
+    requirement def <'COMP-005'> DeliveryPressure {
+        doc /* The regulated delivery setting shall be at least 600000 Pa. */
+        subject regulator : CheckValve;
+        attribute minimum : Real default = 600000.0;
+    }
+    requirement def <'COMP-006'> PressureProtection {
+        doc /* The mechanical relief valve shall open at or below 800000 Pa. */
+        subject valve : ReliefValve;
+        attribute maximum : Real default = 800000.0;
+    }
+    requirement workshopSpecification {
+        doc /* Bounds and declared trace links. */
+        subject compressor : Compressor;
+        requirement pressure : SafePressure { subject tank = compressor.pneumatic.tank; }
+        requirement capacity : StorageCapacity { subject tank = compressor.pneumatic.tank; }
+        requirement temperature : ThermalLimit { subject sensor = compressor.cooling.temperature; }
+        requirement shutdown : SafeShutdown { subject controller = compressor.electrical.controller; }
+        requirement delivery : DeliveryPressure { subject regulator = compressor.pneumatic.regulator; }
+        requirement relief : PressureProtection { subject valve = compressor.pneumatic.relief; }
+    }
+    assert satisfy workshopSpecification.pressure by CompressorSystem::workshop.compressor.pneumatic.tank;
+    assert satisfy workshopSpecification.capacity by CompressorSystem::workshop.compressor.pneumatic.tank;
+    assert satisfy workshopSpecification.temperature by CompressorSystem::workshop.compressor.cooling.temperature;
+    assert satisfy workshopSpecification.shutdown by CompressorSystem::workshop.compressor.electrical.controller;
+    assert satisfy workshopSpecification.delivery by CompressorSystem::workshop.compressor.pneumatic.regulator;
+    assert satisfy workshopSpecification.relief by CompressorSystem::workshop.compressor.pneumatic.relief;
+    verification def CheckPressure {
+        subject compressor : Compressor;
+        objective pressureCheck { verify workshopSpecification.pressure; }
+    }
+    verification def CheckShutdown {
+        subject compressor : Compressor;
+        objective shutdownCheck { verify workshopSpecification.shutdown; }
+    }
+}"#
+            .into(),
+        );
+        files.insert(
+            "views.sysml".into(),
+            r#"package CompressorViews {
+    private import StandardViewDefinitions::*;
+    view def Requirements :> GeneralView;
+    view requirements : Requirements { expose CompressorRequirements::workshopSpecification; }
+}"#
+            .into(),
+        );
+
+        let parsed = SysmlEngine::parse_workspace(&files);
+        let req_view = &parsed.graph.views[&ElementId::new("CompressorViews::requirements")];
+        let (base_input, meta) = build_layout_input_for_view(
+            &parsed.graph,
+            &ViewScope::SysmlView(req_view.id.clone()),
+            req_view.kind,
+            LayoutDirection::TopToBottom,
+        );
+        let layout = syssur_layout::compute_deterministic_layout(&base_input);
+
+        let req_card_count = base_input
+            .nodes
+            .iter()
+            .filter(|n| n.shape == NodeShape::RequirementCard)
+            .count();
+        assert_eq!(req_card_count, 7, "expected workshopSpecification + 6 nested reqs");
+        assert!(
+            !layout.nodes.contains_key("CompressorSystem::Workshop"),
+            "unrelated top-level parts must not leak into requirements view"
+        );
+
+        let pressure_key = "CompressorRequirements::workshopSpecification::pressure";
+        let pressure_meta = &meta[pressure_key];
+        assert_eq!(pressure_meta.short_id.as_deref(), Some("COMP-001"));
+        assert!(pressure_meta.doc.is_some());
+        assert!(pressure_meta
+            .attributes
+            .iter()
+            .any(|a| a.contains("maximum") && a.contains("800000")));
+        assert!(pressure_meta
+            .attributes
+            .iter()
+            .any(|a| a.starts_with("subject tank : Tank")));
+
+        assert_eq!(
+            layout
+                .edges
+                .iter()
+                .filter(|e| e.kind == RelationshipKind::Composition)
+                .count(),
+            6
+        );
+        assert_eq!(
+            layout
+                .edges
+                .iter()
+                .filter(|e| e.kind == RelationshipKind::Satisfy)
+                .count(),
+            6
+        );
+        assert_eq!(
+            layout
+                .edges
+                .iter()
+                .filter(|e| e.kind == RelationshipKind::Verify)
+                .count(),
+            2
         );
     }
 }

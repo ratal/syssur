@@ -2256,7 +2256,12 @@ impl DiagramCanvas {
                 return;
             }
             NodeShape::ActionBox => {
-                let radius = CornerRadius::same((14.0 * self.zoom).clamp(4.0, 18.0) as u8);
+                let is_def = meta.is_some_and(|m| m.is_def);
+                let radius = if is_def {
+                    CornerRadius::ZERO
+                } else {
+                    CornerRadius::same((14.0 * self.zoom).clamp(4.0, 18.0) as u8)
+                };
                 let fill = if is_container {
                     Color32::from_rgba_unmultiplied(28, 38, 48, 220)
                 } else {
@@ -2275,13 +2280,44 @@ impl DiagramCanvas {
                     StrokeKind::Inside,
                 );
                 if lod != RenderLod::Macro {
-                    painter.text(
-                        rect.left_top() + Vec2::new(10.0 * self.zoom, 7.0 * self.zoom),
-                        Align2::LEFT_TOP,
-                        format!("«action» {}", node.label),
-                        FontId::proportional((13.0 * self.zoom).clamp(9.5, 18.0)),
-                        Color32::from_rgb(225, 244, 242),
-                    );
+                    let stereo = meta
+                        .map(|m| m.stereotype.as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(if is_def { "«action def»" } else { "«action»" });
+                    let type_suffix = meta
+                        .and_then(|m| m.type_name.as_deref())
+                        .map(|tn| format!(" : {tn}"))
+                        .unwrap_or_default();
+                    if is_container {
+                        painter.text(
+                            rect.left_top() + Vec2::new(10.0 * self.zoom, 7.0 * self.zoom),
+                            Align2::LEFT_TOP,
+                            format!("{stereo} {}{type_suffix}", node.label),
+                            FontId::proportional((13.0 * self.zoom).clamp(9.5, 18.0)),
+                            Color32::from_rgb(225, 244, 242),
+                        );
+                    } else {
+                        painter.text(
+                            Pos2::new(rect.center().x, rect.top() + 5.0 * self.zoom),
+                            Align2::CENTER_TOP,
+                            stereo,
+                            FontId::proportional((10.5 * self.zoom).clamp(8.5, 13.0)),
+                            Color32::from_rgb(130, 210, 206),
+                        );
+                        painter.text(
+                            Pos2::new(rect.center().x, rect.top() + 19.0 * self.zoom),
+                            Align2::CENTER_TOP,
+                            format!("{}{type_suffix}", node.label),
+                            FontId::proportional((13.0 * self.zoom).clamp(9.5, 18.0)),
+                            Color32::from_rgb(225, 244, 242),
+                        );
+                    }
+                }
+                if lod == RenderLod::Micro && paint_ports {
+                    let nkey = node.path.canonical_key();
+                    for port in &node.ports {
+                        self.paint_port(painter, &nkey, port, origin);
+                    }
                 }
                 return;
             }
@@ -2380,6 +2416,10 @@ impl DiagramCanvas {
                     .and_then(|m| m.short_id.as_deref())
                     .map(|id| format!("<{id}> "))
                     .unwrap_or_default();
+                let type_suffix = meta
+                    .and_then(|m| m.type_name.as_deref())
+                    .map(|tn| format!(" : {tn}"))
+                    .unwrap_or_default();
                 painter.text(
                     Pos2::new(rect.center().x, rect.top() + 5.0 * self.zoom),
                     Align2::CENTER_TOP,
@@ -2390,26 +2430,60 @@ impl DiagramCanvas {
                 painter.text(
                     Pos2::new(rect.center().x, rect.top() + 19.0 * self.zoom),
                     Align2::CENTER_TOP,
-                    format!("{id_badge}{}", node.label),
-                    FontId::proportional((13.5 * self.zoom).clamp(9.5, 18.0)),
+                    format!("{id_badge}{}{type_suffix}", node.label),
+                    FontId::proportional((13.0 * self.zoom).clamp(9.5, 18.0)),
                     Color32::from_gray(242),
                 );
                 if lod == RenderLod::Micro {
-                    if let Some(doc) = meta.and_then(|m| m.doc.as_deref()) {
+                    let attrs = meta.map(|m| m.attributes.as_slice()).unwrap_or(&[]);
+                    let doc = meta.and_then(|m| m.doc.as_deref());
+                    if !attrs.is_empty() || doc.is_some() {
                         let div_y = rect.top() + 37.0 * self.zoom;
                         painter.line_segment(
                             [Pos2::new(rect.left(), div_y), Pos2::new(rect.right(), div_y)],
                             Stroke::new(1.0, Color32::from_rgba_unmultiplied(180, 180, 180, 65)),
                         );
-                        let snippet: String = doc.chars().take(46).collect();
-                        let suffix = if doc.chars().count() > 46 { "..." } else { "" };
-                        painter.text(
-                            rect.left_top() + Vec2::new(8.0 * self.zoom, 41.0 * self.zoom),
-                            Align2::LEFT_TOP,
-                            format!("{snippet}{suffix}"),
-                            FontId::proportional((11.0 * self.zoom).clamp(8.5, 14.0)),
-                            Color32::from_gray(195),
-                        );
+                        let mut y_off = 41.0 * self.zoom;
+                        let attr_font = FontId::monospace((10.5 * self.zoom).clamp(8.0, 13.5));
+                        let attr_col = Color32::from_rgb(205, 222, 240);
+                        for attr in attrs {
+                            painter.text(
+                                rect.left_top() + Vec2::new(8.0 * self.zoom, y_off),
+                                Align2::LEFT_TOP,
+                                attr,
+                                attr_font.clone(),
+                                attr_col,
+                            );
+                            y_off += 14.5 * self.zoom;
+                        }
+                        if let Some(doc_text) = doc {
+                            if !attrs.is_empty() {
+                                y_off += 2.0 * self.zoom;
+                                let sep_y = rect.top() + y_off;
+                                painter.line_segment(
+                                    [Pos2::new(rect.left(), sep_y), Pos2::new(rect.right(), sep_y)],
+                                    Stroke::new(
+                                        0.8,
+                                        Color32::from_rgba_unmultiplied(180, 180, 180, 45),
+                                    ),
+                                );
+                                y_off += 4.0 * self.zoom;
+                            }
+                            let font_id =
+                                FontId::proportional((11.0 * self.zoom).clamp(8.5, 14.0));
+                            let wrap_w = (rect.width() - 16.0 * self.zoom).max(40.0);
+                            let galley = painter.layout(
+                                doc_text.to_string(),
+                                font_id,
+                                Color32::from_gray(195),
+                                wrap_w,
+                            );
+                            painter.galley(
+                                rect.left_top() + Vec2::new(8.0 * self.zoom, y_off),
+                                galley,
+                                Color32::from_gray(195),
+                            );
+                        }
                     }
                 }
                 return;

@@ -184,6 +184,12 @@ pub struct ActionNode {
     pub id: ElementId,
     pub name: String,
     pub kind: ActionNodeKind,
+    #[serde(default)]
+    pub is_def: bool,
+    #[serde(default)]
+    pub type_def: Option<ElementId>,
+    #[serde(default)]
+    pub params: Vec<PortUsage>,
     pub doc: Option<String>,
     pub children: Vec<ActionNode>,
     pub span: Span,
@@ -213,6 +219,8 @@ pub struct StateNode {
 pub struct TransitionEdge {
     pub id: ElementId,
     pub owner_scope: ElementId,
+    #[serde(default)]
+    pub name: Option<String>,
     pub source: String,
     pub target: String,
     pub trigger: Option<String>,
@@ -395,10 +403,28 @@ pub struct ConnectionEdge {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequirementSubject {
+    pub name: String,
+    #[serde(default)]
+    pub type_def: Option<ElementId>,
+    #[serde(default)]
+    pub value_expr: Option<String>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequirementNode {
     pub id: ElementId,
     pub short_id: Option<String>,
     pub name: String,
+    #[serde(default)]
+    pub type_def: Option<ElementId>,
+    #[serde(default)]
+    pub subject: Option<RequirementSubject>,
+    #[serde(default)]
+    pub attributes: Vec<AttributeUsage>,
+    #[serde(default)]
+    pub children: Vec<ElementId>,
     pub doc: Option<String>,
     pub is_usage: bool,
     pub span: Span,
@@ -409,6 +435,8 @@ pub struct TraceLink {
     pub kind: RelationshipKind,
     pub requirement: ElementId,
     pub target: String,
+    #[serde(default)]
+    pub is_asserted: bool,
     pub span: Span,
 }
 
@@ -417,6 +445,8 @@ pub struct ViewDef {
     pub id: ElementId,
     pub name: String,
     pub kind: ViewKind,
+    #[serde(default)]
+    pub base_views: Vec<ElementId>,
     pub is_usage: bool,
     pub expose_patterns: Vec<String>,
     pub include_relationships: Vec<RelationshipKind>,
@@ -506,6 +536,17 @@ impl DefinitionGraph {
         self.states
             .values()
             .find(|st| st.name == short || st.id.as_str().ends_with(&format!("::{short}")))
+    }
+
+    /// Looks up a `RequirementNode` by exact `ElementId` or unique short name.
+    pub fn resolve_requirement(&self, target: &ElementId) -> Option<&RequirementNode> {
+        if let Some(found) = self.requirements.get(target) {
+            return Some(found);
+        }
+        let short = target.short_name();
+        self.requirements
+            .values()
+            .find(|req| req.name == short || req.id.as_str().ends_with(&format!("::{short}")))
     }
 
     /// Looks up a `PortDef` by exact `ElementId` or unique short name.
@@ -1115,6 +1156,9 @@ mod tests {
                 id: act_id.clone(),
                 name: "Visitor Arrival Story".into(),
                 kind: ActionNodeKind::Action,
+                is_def: false,
+                type_def: None,
+                params: vec![],
                 doc: None,
                 children: vec![],
                 span: Span::new("behavior.sysml", 0, 20),

@@ -327,6 +327,7 @@ mod tests {
                     kind: RelationshipKind::Satisfy,
                     requirement: ElementId::new("PowerBudgetReq"),
                     target: "nominalRover.powertrain".into(),
+                    is_asserted: false,
                     span: Span::new("vehicle.sysml", 0, 10),
                 }],
             )
