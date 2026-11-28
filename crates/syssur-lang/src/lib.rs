@@ -20,9 +20,10 @@ use sysmlv2_model::json::ResolvedModel;
 use sysmlv2_model::model::Model;
 use sysmlv2_model::prepared::PreparedLibrary;
 use sysmlv2_syntax::ast::{
-    BinaryOp, DefKind, Definition, Expr, ExprKind, FeatureDirection, FeatureSpecialization,
-    Literal, Member, MemberKind, Multiplicity, PortionKind, SourceUnit, StateSubactionKind,
-    TargetRef, TriggerKind, UnaryOp, Usage, UsageDetail, UsageKind, Visibility,
+    BinaryOp, ClassificationOp, DefKind, Definition, Expr, ExprKind, FeatureDirection,
+    FeatureSpecialization, Literal, Member, MemberKind, Multiplicity, PortionKind, SourceUnit,
+    StateSubactionKind, TargetRef, TriggerKind, UnaryOp, Usage, UsageDetail, UsageKind,
+    Visibility,
 };
 use sysmlv2_syntax::diag::Severity;
 use sysmlv2_syntax::parser::parse_source;
@@ -669,6 +670,7 @@ fn extract_definition(
         }
         DefKind::View => {
             let expose_patterns = extract_expose_patterns(def.body.as_deref());
+            let element_filters = extract_view_filters(def.body.as_deref());
             let base_views: Vec<ElementId> = def
                 .specializes
                 .iter()
@@ -684,6 +686,7 @@ fn extract_definition(
                     base_views,
                     is_usage: false,
                     expose_patterns,
+                    element_filters,
                     include_relationships: Vec::new(),
                     span,
                 },
@@ -873,6 +876,7 @@ fn extract_top_level_usage(
                 }
                 let kind = infer_view_kind(&name, base_views.first());
                 let expose_patterns = extract_expose_patterns(usage.body.as_deref());
+                let element_filters = extract_view_filters(usage.body.as_deref());
                 graph.views.insert(
                     view_id.clone(),
                     ViewDef {
@@ -882,6 +886,7 @@ fn extract_top_level_usage(
                         base_views,
                         is_usage: true,
                         expose_patterns,
+                        element_filters,
                         include_relationships: Vec::new(),
                         span,
                     },
@@ -1019,6 +1024,7 @@ fn extract_verify_usage(
             requirement: req_id,
             target: verifier,
             is_asserted: false,
+            is_negated: false,
             span,
         });
     }
@@ -1438,7 +1444,7 @@ fn extract_satisfy_usage(
             _ => None,
         })
         .or_else(|| usage_name(usage).map(ElementId::new));
-    if let (Some(req_id), UsageDetail::Satisfy { asserted, by, .. }) = (req, &usage.detail) {
+    if let (Some(req_id), UsageDetail::Satisfy { asserted, negated, by }) = (req, &usage.detail) {
         let target = by
             .as_ref()
             .map(target_ref_display)
@@ -1448,6 +1454,7 @@ fn extract_satisfy_usage(
             requirement: req_id,
             target,
             is_asserted: *asserted,
+            is_negated: *negated,
             span,
         });
     }
@@ -1478,6 +1485,43 @@ fn extract_expose_patterns(body: Option<&[Member]>) -> Vec<String> {
         }
     }
     expose_patterns
+}
+
+fn extract_view_filters(body: Option<&[Member]>) -> Vec<String> {
+    fn collect_expr(expr: &Expr, out: &mut Vec<String>) {
+        match &expr.kind {
+            ExprKind::Literal(Literal::Bool(false)) => out.push("false".to_string()),
+            ExprKind::Classification {
+                op:
+                    ClassificationOp::AtType
+                    | ClassificationOp::MetaAtType
+                    | ClassificationOp::Meta
+                    | ClassificationOp::IsType
+                    | ClassificationOp::HasType,
+                ty,
+                ..
+            } => out.push(target_ref_display(ty)),
+            ExprKind::Binary {
+                op: BinaryOp::CondOr | BinaryOp::OrBar | BinaryOp::CondAnd | BinaryOp::AndAmp,
+                lhs,
+                rhs,
+            } => {
+                collect_expr(lhs, out);
+                collect_expr(rhs, out);
+            }
+            _ => {}
+        }
+    }
+
+    let mut filters = Vec::new();
+    if let Some(members) = body {
+        for m in members {
+            if let MemberKind::Filter(expr) = &m.kind {
+                collect_expr(expr, &mut filters);
+            }
+        }
+    }
+    filters
 }
 
 fn infer_standard_view_kind(type_ref: &ElementId) -> Option<ViewKind> {
@@ -1514,6 +1558,33 @@ fn infer_view_kind(name: &str, type_ref: Option<&ElementId>) -> ViewKind {
 }
 
 fn resolve_inherited_view_kinds(graph: &mut DefinitionGraph) {
+    fn find_base_view_id(
+        views: &BTreeMap<ElementId, ViewDef>,
+        view_id: &ElementId,
+        base: &ElementId,
+    ) -> Option<ElementId> {
+        let short = base.short_name();
+        let scope_prefix = view_id.as_str().rsplit_once("::").map(|(p, _)| p);
+        if views.contains_key(base) {
+            Some(base.clone())
+        } else if let Some(prefix) = scope_prefix {
+            let sibling = ElementId::new(format!("{prefix}::{short}"));
+            if views.contains_key(&sibling) {
+                Some(sibling)
+            } else {
+                views
+                    .values()
+                    .find(|v| v.name == short || v.id.as_str().ends_with(&format!("::{short}")))
+                    .map(|v| v.id.clone())
+            }
+        } else {
+            views
+                .values()
+                .find(|v| v.name == short || v.id.as_str().ends_with(&format!("::{short}")))
+                .map(|v| v.id.clone())
+        }
+    }
+
     fn resolve_recursive(
         views: &BTreeMap<ElementId, ViewDef>,
         view_id: &ElementId,
@@ -1528,28 +1599,8 @@ fn resolve_inherited_view_kinds(graph: &mut DefinitionGraph) {
                 return Some(kind);
             }
         }
-        let scope_prefix = view_id.as_str().rsplit_once("::").map(|(p, _)| p);
         for base in &view.base_views {
-            let short = base.short_name();
-            let target_id = if views.contains_key(base) {
-                Some(base.clone())
-            } else if let Some(prefix) = scope_prefix {
-                let sibling = ElementId::new(format!("{prefix}::{short}"));
-                if views.contains_key(&sibling) {
-                    Some(sibling)
-                } else {
-                    views
-                        .values()
-                        .find(|v| v.name == short || v.id.as_str().ends_with(&format!("::{short}")))
-                        .map(|v| v.id.clone())
-                }
-            } else {
-                views
-                    .values()
-                    .find(|v| v.name == short || v.id.as_str().ends_with(&format!("::{short}")))
-                    .map(|v| v.id.clone())
-            };
-            if let Some(tid) = target_id {
+            if let Some(tid) = find_base_view_id(views, view_id, base) {
                 if let Some(kind) = resolve_recursive(views, &tid, visited) {
                     return Some(kind);
                 }
@@ -1558,12 +1609,45 @@ fn resolve_inherited_view_kinds(graph: &mut DefinitionGraph) {
         None
     }
 
+    fn resolve_filters_recursive(
+        views: &BTreeMap<ElementId, ViewDef>,
+        view_id: &ElementId,
+        visited: &mut BTreeSet<ElementId>,
+    ) -> Vec<String> {
+        if !visited.insert(view_id.clone()) {
+            return Vec::new();
+        }
+        let Some(view) = views.get(view_id) else {
+            return Vec::new();
+        };
+        if !view.element_filters.is_empty() {
+            return view.element_filters.clone();
+        }
+        let mut out = Vec::new();
+        for base in &view.base_views {
+            if let Some(tid) = find_base_view_id(views, view_id, base) {
+                for f in resolve_filters_recursive(views, &tid, visited) {
+                    if !out.contains(&f) {
+                        out.push(f);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     let ids: Vec<ElementId> = graph.views.keys().cloned().collect();
     for id in ids {
         let mut visited = BTreeSet::new();
-        if let Some(kind) = resolve_recursive(&graph.views, &id, &mut visited) {
-            if let Some(v) = graph.views.get_mut(&id) {
+        let kind_opt = resolve_recursive(&graph.views, &id, &mut visited);
+        let mut f_visited = BTreeSet::new();
+        let filters = resolve_filters_recursive(&graph.views, &id, &mut f_visited);
+        if let Some(v) = graph.views.get_mut(&id) {
+            if let Some(kind) = kind_opt {
                 v.kind = kind;
+            }
+            if v.element_filters.is_empty() && !filters.is_empty() {
+                v.element_filters = filters;
             }
         }
     }
@@ -1844,6 +1928,20 @@ fn format_expr(expr: &Expr) -> String {
             format_expr(then_branch),
             format_expr(else_branch)
         ),
+        ExprKind::Classification { op, operand, ty } => {
+            let kw = match op {
+                ClassificationOp::AtType => "@",
+                ClassificationOp::MetaAtType => "@@",
+                ClassificationOp::IsType => "istype ",
+                ClassificationOp::HasType => "hastype ",
+                ClassificationOp::As => "as ",
+                ClassificationOp::Meta => "meta ",
+            };
+            match operand {
+                Some(lhs) => format!("{} {kw}{}", format_expr(lhs), target_ref_display(ty)),
+                None => format!("{kw}{}", target_ref_display(ty)),
+            }
+        }
         _ => "<expr>".to_string(),
     }
 }

@@ -199,103 +199,183 @@ pub fn compute_layout_with_port_overrides(
     let mut edges = input.edges.clone();
     edges.sort_by(|a, b| a.span.cmp(&b.span).then_with(|| a.id.cmp(&b.id)));
 
-    // 2. Build compound Dagre graph in sorted order.
-    let has_compound = nodes.iter().any(|n| n.parent.is_some());
-    let parent_keys: BTreeSet<String> = nodes
+    // 2. Partition into connected components (keeping compound trees intact) and lay each out
+    // with Dagre, then pack multiple disconnected components deterministically without overlap.
+    let node_by_key: BTreeMap<String, &LayoutNodeSpec> = nodes
         .iter()
-        .filter_map(|n| n.parent.as_ref().map(|p| p.canonical_key()))
+        .map(|n| (n.path.canonical_key(), n))
         .collect();
-    let mut graph: Graph<NodeLabel, EdgeLabel> = Graph::with_options(GraphOptions {
-        directed: true,
-        multigraph: true,
-        compound: has_compound,
-    });
-
+    let parent_key_of: BTreeMap<String, Option<String>> = nodes
+        .iter()
+        .map(|n| {
+            let pkey = n
+                .parent
+                .as_ref()
+                .map(|p| p.canonical_key())
+                .filter(|pk| node_by_key.contains_key(pk));
+            (n.path.canonical_key(), pkey)
+        })
+        .collect();
+    let mut root_of: BTreeMap<String, String> = BTreeMap::new();
     for node in &nodes {
         let key = node.path.canonical_key();
-        let is_parent = parent_keys.contains(&key);
-        graph.set_node(
-            key.clone(),
-            Some(NodeLabel {
-                width: node.width as f64,
-                height: node.height as f64,
-                padding: if is_parent { 32.0 } else { 20.0 },
-                padding_x: is_parent.then_some(26.0),
-                padding_y: is_parent.then_some(44.0),
-                ..Default::default()
-            }),
-        );
+        let mut cur = key.clone();
+        for _ in 0..nodes.len() {
+            if let Some(Some(pk)) = parent_key_of.get(&cur) {
+                cur = pk.clone();
+            } else {
+                break;
+            }
+        }
+        root_of.insert(key, cur);
     }
 
-    if has_compound {
-        for node in &nodes {
-            if let Some(ref parent) = node.parent {
-                let pkey = parent.canonical_key();
-                if graph.has_node(&pkey) {
-                    graph.set_parent(&node.path.canonical_key(), Some(&pkey));
+    let mut uf: BTreeMap<String, String> = root_of
+        .values()
+        .cloned()
+        .map(|r| (r.clone(), r))
+        .collect();
+    fn uf_find(uf: &mut BTreeMap<String, String>, k: &str) -> String {
+        let mut cur = k.to_string();
+        while let Some(p) = uf.get(&cur).cloned() {
+            if p == cur {
+                break;
+            }
+            cur = p;
+        }
+        let mut walk = k.to_string();
+        while let Some(p) = uf.get(&walk).cloned() {
+            if p == walk || p == cur {
+                break;
+            }
+            uf.insert(walk, cur.clone());
+            walk = p;
+        }
+        cur
+    }
+    for edge in &edges {
+        let sk = edge.source_node.canonical_key();
+        let dk = edge.target_node.canonical_key();
+        if let (Some(rs), Some(rd)) = (root_of.get(&sk).cloned(), root_of.get(&dk).cloned()) {
+            let fs = uf_find(&mut uf, &rs);
+            let fd = uf_find(&mut uf, &rd);
+            if fs != fd {
+                let (keep, drop) = if fs < fd { (fs, fd) } else { (fd, fs) };
+                uf.insert(drop, keep);
+            }
+        }
+    }
+
+    struct ComponentGroup<'a> {
+        min_key: (Span, String),
+        nodes: Vec<&'a LayoutNodeSpec>,
+        edges: Vec<&'a LayoutEdgeSpec>,
+    }
+    let mut groups: BTreeMap<String, ComponentGroup<'_>> = BTreeMap::new();
+    for node in &nodes {
+        let key = node.path.canonical_key();
+        let root = &root_of[&key];
+        let rep = uf_find(&mut uf, root);
+        let sort_key = (node.span.clone(), key);
+        let entry = groups.entry(rep).or_insert_with(|| ComponentGroup {
+            min_key: sort_key.clone(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        });
+        if sort_key < entry.min_key {
+            entry.min_key = sort_key;
+        }
+        entry.nodes.push(node);
+    }
+    for edge in &edges {
+        let sk = edge.source_node.canonical_key();
+        let dk = edge.target_node.canonical_key();
+        if let (Some(rs), Some(rd)) = (root_of.get(&sk), root_of.get(&dk)) {
+            let rep = uf_find(&mut uf, rs);
+            let rep_d = uf_find(&mut uf, rd);
+            if rep == rep_d {
+                if let Some(g) = groups.get_mut(&rep) {
+                    g.edges.push(edge);
                 }
             }
         }
     }
 
-    for edge in &edges {
-        let src = edge.source_node.canonical_key();
-        let dst = edge.target_node.canonical_key();
-        if graph.has_node(&src) && graph.has_node(&dst) {
-            graph.set_edge(
-                src,
-                dst,
-                Some(EdgeLabel {
-                    minlen: 1,
-                    weight: 1,
-                    ..Default::default()
-                }),
-                Some(&edge.id),
-            );
+    let mut ordered_components: Vec<ComponentGroup<'_>> = groups.into_values().collect();
+    ordered_components.sort_by(|a, b| a.min_key.cmp(&b.min_key));
+
+    let mut base_rects: BTreeMap<String, Rect2> = BTreeMap::new();
+    if ordered_components.len() <= 1 {
+        if let Some(comp) = ordered_components.into_iter().next() {
+            for (k, r) in layout_component_with_dagre(&comp.nodes, &comp.edges, input.direction) {
+                base_rects.insert(
+                    k,
+                    Rect2 {
+                        x: r.x + 32.0,
+                        y: r.y + 32.0,
+                        w: r.w,
+                        h: r.h,
+                    },
+                );
+            }
+        }
+    } else {
+        let max_row_w = 1350.0f32;
+        let gap_x = 56.0f32;
+        let gap_y = 56.0f32;
+        let mut cursor_x = 32.0f32;
+        let mut cursor_y = 32.0f32;
+        let mut row_h = 0.0f32;
+        for comp in ordered_components {
+            let comp_rects = layout_component_with_dagre(&comp.nodes, &comp.edges, input.direction);
+            let mut comp_w = 0.0f32;
+            let mut comp_h = 0.0f32;
+            for r in comp_rects.values() {
+                comp_w = comp_w.max(r.x + r.w);
+                comp_h = comp_h.max(r.y + r.h);
+            }
+            if cursor_x > 32.0 && cursor_x + comp_w > max_row_w {
+                cursor_x = 32.0;
+                cursor_y += row_h + gap_y;
+                row_h = 0.0;
+            }
+            for (k, r) in comp_rects {
+                base_rects.insert(
+                    k,
+                    Rect2 {
+                        x: r.x + cursor_x,
+                        y: r.y + cursor_y,
+                        w: r.w,
+                        h: r.h,
+                    },
+                );
+            }
+            cursor_x += comp_w + gap_x;
+            row_h = row_h.max(comp_h);
         }
     }
 
-    let rankdir = match input.direction {
-        LayoutDirection::LeftToRight => RankDir::LR,
-        LayoutDirection::TopToBottom => RankDir::TB,
-    };
+    let has_compound = nodes.iter().any(|n| n.parent.is_some());
 
-    layout(
-        &mut graph,
-        Some(LayoutOptions {
-            rankdir,
-            nodesep: 48.0,
-            ranksep: 68.0,
-            edgesep: 24.0,
-            marginx: 32.0,
-            marginy: 32.0,
-            ..Default::default()
-        }),
-    );
-
-    // 3. Extract base bounding boxes & apply interactive node offsets.
+    // 3. Apply interactive node offsets.
     let mut positioned_nodes = BTreeMap::new();
     for node in &nodes {
         let key = node.path.canonical_key();
-        let label = graph.node(&key);
-        let (cx, cy, w, h) = match label {
-            Some(nl) => (
-                nl.x.unwrap_or(0.0) as f32,
-                nl.y.unwrap_or(0.0) as f32,
-                nl.width.max(node.width as f64) as f32,
-                nl.height.max(node.height as f64) as f32,
-            ),
-            None => (0.0, 0.0, node.width, node.height),
-        };
+        let base = base_rects.get(&key).copied().unwrap_or(Rect2 {
+            x: 0.0,
+            y: 0.0,
+            w: node.width,
+            h: node.height,
+        });
         let off = node_offsets
             .get(&key)
             .copied()
             .unwrap_or(Point2 { x: 0.0, y: 0.0 });
         let rect = Rect2 {
-            x: cx - w * 0.5 + off.x,
-            y: cy - h * 0.5 + off.y,
-            w,
-            h,
+            x: base.x + off.x,
+            y: base.y + off.y,
+            w: base.w,
+            h: base.h,
         };
 
         positioned_nodes.insert(
@@ -479,6 +559,168 @@ pub fn compute_layout_with_port_overrides(
         edges: routed_edges,
         bounds,
     }
+}
+
+fn layout_component_with_dagre(
+    comp_nodes: &[&LayoutNodeSpec],
+    comp_edges: &[&LayoutEdgeSpec],
+    direction: LayoutDirection,
+) -> BTreeMap<String, Rect2> {
+    let has_compound = comp_nodes.iter().any(|n| n.parent.is_some());
+    let parent_keys: BTreeSet<String> = comp_nodes
+        .iter()
+        .filter_map(|n| n.parent.as_ref().map(|p| p.canonical_key()))
+        .collect();
+    let mut graph: Graph<NodeLabel, EdgeLabel> = Graph::with_options(GraphOptions {
+        directed: true,
+        multigraph: true,
+        compound: has_compound,
+    });
+
+    for node in comp_nodes {
+        let key = node.path.canonical_key();
+        let is_parent = parent_keys.contains(&key);
+        graph.set_node(
+            key,
+            Some(NodeLabel {
+                width: node.width as f64,
+                height: node.height as f64,
+                padding: if is_parent { 32.0 } else { 20.0 },
+                padding_x: is_parent.then_some(26.0),
+                padding_y: is_parent.then_some(44.0),
+                ..Default::default()
+            }),
+        );
+    }
+
+    if has_compound {
+        for node in comp_nodes {
+            if let Some(ref parent) = node.parent {
+                let pkey = parent.canonical_key();
+                if graph.has_node(&pkey) {
+                    graph.set_parent(&node.path.canonical_key(), Some(&pkey));
+                }
+            }
+        }
+    }
+
+    for edge in comp_edges {
+        let src = edge.source_node.canonical_key();
+        let dst = edge.target_node.canonical_key();
+        if graph.has_node(&src) && graph.has_node(&dst) {
+            graph.set_edge(
+                src,
+                dst,
+                Some(EdgeLabel {
+                    minlen: 1,
+                    weight: 1,
+                    ..Default::default()
+                }),
+                Some(&edge.id),
+            );
+        }
+    }
+
+    let rankdir = match direction {
+        LayoutDirection::LeftToRight => RankDir::LR,
+        LayoutDirection::TopToBottom => RankDir::TB,
+    };
+
+    layout(
+        &mut graph,
+        Some(LayoutOptions {
+            rankdir,
+            nodesep: 48.0,
+            ranksep: 68.0,
+            edgesep: 24.0,
+            marginx: 32.0,
+            marginy: 32.0,
+            ..Default::default()
+        }),
+    );
+
+    let mut rects = BTreeMap::new();
+    for node in comp_nodes {
+        let key = node.path.canonical_key();
+        let rect = match graph.node(&key) {
+            Some(nl) => {
+                let cx = nl.x.unwrap_or(0.0) as f32;
+                let cy = nl.y.unwrap_or(0.0) as f32;
+                let w = nl.width.max(node.width as f64) as f32;
+                let h = nl.height.max(node.height as f64) as f32;
+                Rect2 {
+                    x: cx - w * 0.5,
+                    y: cy - h * 0.5,
+                    w,
+                    h,
+                }
+            }
+            None => Rect2 {
+                x: 0.0,
+                y: 0.0,
+                w: node.width,
+                h: node.height,
+            },
+        };
+        rects.insert(key, rect);
+    }
+
+    if has_compound {
+        let mut child_order: Vec<usize> = (0..comp_nodes.len()).collect();
+        child_order.sort_by(|&a, &b| {
+            comp_nodes[b]
+                .path
+                .0
+                .len()
+                .cmp(&comp_nodes[a].path.0.len())
+                .then_with(|| {
+                    comp_nodes[a]
+                        .path
+                        .canonical_key()
+                        .cmp(&comp_nodes[b].path.canonical_key())
+                })
+        });
+        for idx in child_order {
+            let node = comp_nodes[idx];
+            if let Some(ref parent) = node.parent {
+                let ckey = node.path.canonical_key();
+                let pkey = parent.canonical_key();
+                if let Some(&child_rect) = rects.get(&ckey) {
+                    if let Some(parent_rect) = rects.get_mut(&pkey) {
+                        let pad_x = 22.0;
+                        let pad_top = 44.0;
+                        let pad_bot = 20.0;
+                        let min_x = parent_rect.x.min(child_rect.x - pad_x);
+                        let min_y = parent_rect.y.min(child_rect.y - pad_top);
+                        let max_x = (parent_rect.x + parent_rect.w)
+                            .max(child_rect.x + child_rect.w + pad_x);
+                        let max_y = (parent_rect.y + parent_rect.h)
+                            .max(child_rect.y + child_rect.h + pad_bot);
+                        *parent_rect = Rect2 {
+                            x: min_x,
+                            y: min_y,
+                            w: max_x - min_x,
+                            h: max_y - min_y,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    let mut min_x = f32::MAX;
+    let mut min_y = f32::MAX;
+    for r in rects.values() {
+        min_x = min_x.min(r.x);
+        min_y = min_y.min(r.y);
+    }
+    if min_x.is_finite() && min_y.is_finite() {
+        for r in rects.values_mut() {
+            r.x -= min_x;
+            r.y -= min_y;
+        }
+    }
+    rects
 }
 
 fn pin_ports_on_border(
@@ -1578,5 +1820,150 @@ mod tests {
         );
         assert_eq!(out.edges.len(), 1);
         assert!(out.edges[0].waypoints.len() >= 2);
+    }
+
+    #[test]
+    fn compound_plus_disconnected_components_never_overlap() {
+        let comp = InstancePath::root(ElementId::new("Pkg::CoolingAssembly"));
+        let child_a = comp.push(ElementId::new("Pkg::CoolingAssembly::fan"));
+        let child_b = comp.push(ElementId::new("Pkg::CoolingAssembly::temp"));
+        let sensor = InstancePath::root(ElementId::new("Pkg::Sensor"));
+        let p_sensor = InstancePath::root(ElementId::new("Pkg::PressureSensor"));
+        let t_sensor = InstancePath::root(ElementId::new("Pkg::TemperatureSensor"));
+
+        let mut nodes = vec![
+            LayoutNodeSpec {
+                path: comp.clone(),
+                parent: None,
+                label: "CoolingAssembly".into(),
+                shape: NodeShape::PartBlock,
+                width: 180.0,
+                height: 86.0,
+                ports: vec![],
+                span: Span::new("c.sysml", 10, 20),
+            },
+            LayoutNodeSpec {
+                path: child_a,
+                parent: Some(comp.clone()),
+                label: "fan".into(),
+                shape: NodeShape::PartBlock,
+                width: 150.0,
+                height: 60.0,
+                ports: vec![],
+                span: Span::new("c.sysml", 21, 30),
+            },
+            LayoutNodeSpec {
+                path: child_b,
+                parent: Some(comp.clone()),
+                label: "temp".into(),
+                shape: NodeShape::PartBlock,
+                width: 150.0,
+                height: 60.0,
+                ports: vec![],
+                span: Span::new("c.sysml", 31, 40),
+            },
+            LayoutNodeSpec {
+                path: sensor.clone(),
+                parent: None,
+                label: "Sensor".into(),
+                shape: NodeShape::PartBlock,
+                width: 160.0,
+                height: 70.0,
+                ports: vec![],
+                span: Span::new("c.sysml", 41, 50),
+            },
+            LayoutNodeSpec {
+                path: p_sensor.clone(),
+                parent: None,
+                label: "PressureSensor".into(),
+                shape: NodeShape::PartBlock,
+                width: 190.0,
+                height: 70.0,
+                ports: vec![],
+                span: Span::new("c.sysml", 51, 60),
+            },
+            LayoutNodeSpec {
+                path: t_sensor.clone(),
+                parent: None,
+                label: "TemperatureSensor".into(),
+                shape: NodeShape::PartBlock,
+                width: 210.0,
+                height: 70.0,
+                ports: vec![],
+                span: Span::new("c.sysml", 61, 70),
+            },
+        ];
+        for i in 0..8 {
+            nodes.push(LayoutNodeSpec {
+                path: InstancePath::root(ElementId::new(format!("Pkg::Standalone{i}"))),
+                parent: None,
+                label: format!("Standalone{i}"),
+                shape: NodeShape::PartBlock,
+                width: 170.0,
+                height: 75.0,
+                ports: vec![],
+                span: Span::new("c.sysml", 100 + i * 10, 108 + i * 10),
+            });
+        }
+
+        let edges = vec![
+            LayoutEdgeSpec {
+                id: "s1".into(),
+                source_node: p_sensor,
+                source_port: None,
+                target_node: sensor.clone(),
+                target_port: None,
+                kind: RelationshipKind::Specialization,
+                label: Some(":>".into()),
+                guard: None,
+                span: Span::new("c.sysml", 51, 60),
+            },
+            LayoutEdgeSpec {
+                id: "s2".into(),
+                source_node: t_sensor,
+                source_port: None,
+                target_node: sensor,
+                target_port: None,
+                kind: RelationshipKind::Specialization,
+                label: Some(":>".into()),
+                guard: None,
+                span: Span::new("c.sysml", 61, 70),
+            },
+        ];
+
+        let input = LayoutInput {
+            direction: LayoutDirection::TopToBottom,
+            nodes: nodes.clone(),
+            edges: edges.clone(),
+        };
+        let out = compute_deterministic_layout(&input);
+
+        let top_keys: Vec<_> = nodes
+            .iter()
+            .filter(|n| n.parent.is_none())
+            .map(|n| n.path.canonical_key())
+            .collect();
+        for i in 0..top_keys.len() {
+            for j in (i + 1)..top_keys.len() {
+                let a = out.nodes[&top_keys[i]].rect;
+                let b = out.nodes[&top_keys[j]].rect;
+                assert!(
+                    a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y,
+                    "nodes {} ({a:?}) and {} ({b:?}) must not overlap",
+                    top_keys[i],
+                    top_keys[j]
+                );
+            }
+        }
+
+        let mut edges = edges;
+        nodes.reverse();
+        edges.reverse();
+        let rev_out = compute_deterministic_layout(&LayoutInput {
+            direction: LayoutDirection::TopToBottom,
+            nodes,
+            edges,
+        });
+        assert_eq!(out, rev_out);
     }
 }

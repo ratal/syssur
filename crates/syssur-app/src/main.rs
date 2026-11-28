@@ -3691,6 +3691,7 @@ fn build_layout_input_for_view(
     let filter = match scope {
         ViewScope::SysmlView(vid) => graph.views.get(vid).map(|v| ViewFilter {
             expose_patterns: v.expose_patterns.clone(),
+            element_filters: v.element_filters.clone(),
             include_relationships: v.include_relationships.clone(),
         }),
         ViewScope::AdHocRoot(_) => None,
@@ -4185,16 +4186,47 @@ fn populate_filtered_structural_nodes(
 
     let before_count = input.nodes.len();
     let mut shown_part_defs = 0usize;
-    for root in &part_def_roots {
-        if shown_part_defs >= max_part_defs {
-            break;
+    if filter.allows_metaclass("PartDefinition") {
+        for root in &part_def_roots {
+            if shown_part_defs >= max_part_defs {
+                break;
+            }
+            if let Some(tree) = InstanceNode::expand_from_graph(graph, root, max_depth) {
+                if !filter.expose_patterns.is_empty()
+                    || !tree.children.is_empty()
+                    || !instantiated_types.contains(root)
+                    || graph.part_defs.len() <= 6
+                {
+                    shown_part_defs += 1;
+                    collect_layout_nodes_filtered(
+                        graph,
+                        &tree,
+                        None,
+                        include_root_parent,
+                        Some(filter),
+                        expand_matched_descendants,
+                        expanded_keys,
+                        input,
+                        meta,
+                    );
+                }
+            }
         }
-        if let Some(tree) = InstanceNode::expand_from_graph(graph, root, max_depth) {
-            if !tree.children.is_empty()
-                || !instantiated_types.contains(root)
-                || graph.part_defs.len() <= 6
-            {
-                shown_part_defs += 1;
+    }
+
+    if filter.allows_metaclass("PartUsage") {
+        for root_id in graph.top_level_parts.keys() {
+            let root_prefix = format!("{}::", root_id.as_str());
+            let root_relevant = filter.expose_patterns.is_empty()
+                || filter.matches_element(root_id)
+                || filter
+                    .expose_patterns
+                    .iter()
+                    .any(|p| p.starts_with(&root_prefix));
+            if !root_relevant {
+                continue;
+            }
+            if let Some(tree) = InstanceNode::expand_from_graph(graph, root_id, max_depth.max(3)) {
                 collect_layout_nodes_filtered(
                     graph,
                     &tree,
@@ -4210,23 +4242,7 @@ fn populate_filtered_structural_nodes(
         }
     }
 
-    for root_id in graph.top_level_parts.keys() {
-        if let Some(tree) = InstanceNode::expand_from_graph(graph, root_id, max_depth.max(3)) {
-            collect_layout_nodes_filtered(
-                graph,
-                &tree,
-                None,
-                include_root_parent,
-                Some(filter),
-                expand_matched_descendants,
-                expanded_keys,
-                input,
-                meta,
-            );
-        }
-    }
-
-    if input.nodes.len() == before_count {
+    if input.nodes.len() == before_count && filter.allows_metaclass("PartDefinition") {
         for root in part_def_roots.iter().take(max_part_defs) {
             if let Some(tree) = InstanceNode::expand_from_graph(graph, root, max_depth) {
                 collect_layout_nodes_filtered(
@@ -4253,7 +4269,12 @@ fn populate_filtered_structural_nodes(
         if extra_count >= max_extras {
             break;
         }
-        if filter.matches_element(&req.id) {
+        let req_meta = if req.is_usage {
+            "RequirementUsage"
+        } else {
+            "RequirementDefinition"
+        };
+        if filter.allows_metaclass(req_meta) && filter.matches_element(&req.id) {
             push_requirement_node_recursive(
                 graph,
                 req,
@@ -4270,7 +4291,12 @@ fn populate_filtered_structural_nodes(
         if extra_count >= max_extras {
             break;
         }
-        if filter.matches_element(&st.id) {
+        let st_meta = if st.is_def {
+            "StateDefinition"
+        } else {
+            "StateUsage"
+        };
+        if filter.allows_metaclass(st_meta) && filter.matches_element(&st.id) {
             let path = InstancePath::root(st.id.clone());
             if expanded_keys.insert(path.canonical_key()) {
                 extra_count += 1;
@@ -4313,6 +4339,10 @@ fn populate_filtered_structural_nodes(
     for elem in graph.generic_elements.values() {
         if extra_count >= max_extras {
             break;
+        }
+        let elem_metaclass = sysml_metaclass_for_generic(elem.kind, elem.is_def);
+        if !filter.allows_metaclass(elem_metaclass) {
+            continue;
         }
         if !filter.matches_element(&elem.id) {
             continue;
@@ -4444,6 +4474,7 @@ fn build_structural_layout(
             } else if graph.packages.contains_key(root_id) {
                 let pkg_filter = ViewFilter {
                     expose_patterns: vec![format!("{}::**", root_id.as_str())],
+                    element_filters: Vec::new(),
                     include_relationships: Vec::new(),
                 };
                 populate_filtered_structural_nodes(
@@ -4513,12 +4544,22 @@ fn build_structural_layout(
             let target_leaf = link.target.rsplit('.').next().unwrap_or(&link.target);
             if let Some(req_node) = resolve_visible_requirement_path(&link.requirement, &input.nodes)
             {
-                let part_node = input
-                    .nodes
-                    .iter()
-                    .find(|n| n.shape != NodeShape::RequirementCard && n.label == target_leaf)
-                    .map(|n| n.path.clone())
-                    .or_else(|| related_by_target.get(&link.target).cloned())
+                let target_is_simple = !link.target.contains("::") && !link.target.contains('.');
+                let exact_target_id = ElementId::new(&link.target);
+                let part_node = related_by_target
+                    .get(&link.target)
+                    .cloned()
+                    .or_else(|| {
+                        input
+                            .nodes
+                            .iter()
+                            .find(|n| {
+                                n.shape != NodeShape::RequirementCard
+                                    && (n.path.leaf() == Some(&exact_target_id)
+                                        || (target_is_simple && n.label == target_leaf))
+                            })
+                            .map(|n| n.path.clone())
+                    })
                     .unwrap_or_else(|| {
                         let resolved = resolve_trace_target_context(
                             graph,
@@ -4581,6 +4622,10 @@ fn build_structural_layout(
 
                 let lbl = if link.kind == RelationshipKind::Verify {
                     "«verify»"
+                } else if link.is_asserted && link.is_negated {
+                    "«assert not satisfy»"
+                } else if link.is_negated {
+                    "«not satisfy»"
                 } else if link.is_asserted {
                     "«assert satisfy»"
                 } else {
@@ -4600,15 +4645,57 @@ fn build_structural_layout(
             }
         }
 
+        for (idx, req) in graph.requirements.values().enumerate() {
+            if !req.is_usage {
+                continue;
+            }
+            let src_path = InstancePath::root(req.id.clone());
+            if !expanded_keys.contains(&src_path.canonical_key()) {
+                continue;
+            }
+            if let Some(ref td) = req.type_def {
+                if let Some(def_req) = graph.resolve_requirement(td) {
+                    if def_req.id != req.id {
+                        let dst_path = InstancePath::root(def_req.id.clone());
+                        if expanded_keys.contains(&dst_path.canonical_key()) {
+                            input.edges.push(LayoutEdgeSpec {
+                                id: format!("req_type#{idx}"),
+                                source_node: src_path,
+                                source_port: None,
+                                target_node: dst_path,
+                                target_port: None,
+                                kind: RelationshipKind::Specialization,
+                                label: Some("typed by".to_string()),
+                                guard: None,
+                                span: req.span.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         for (idx, pd) in graph.part_defs.values().enumerate() {
-            if let Some(sub_node) = visible_by_short.get(&pd.name) {
+            let def_path = InstancePath::root(pd.id.clone());
+            let sub_node = if expanded_keys.contains(&def_path.canonical_key()) {
+                Some(def_path)
+            } else {
+                visible_by_short.get(&pd.name).cloned()
+            };
+            if let Some(sub_node) = sub_node {
                 for sup in &pd.specializes {
-                    if let Some(sup_node) = visible_by_short.get(sup.short_name()) {
+                    let sup_resolved = graph
+                        .resolve_part_def(sup)
+                        .map(|s| InstancePath::root(s.id.clone()))
+                        .filter(|p| expanded_keys.contains(&p.canonical_key()));
+                    let sup_node =
+                        sup_resolved.or_else(|| visible_by_short.get(sup.short_name()).cloned());
+                    if let Some(sup_node) = sup_node {
                         input.edges.push(LayoutEdgeSpec {
                             id: format!("spec#{idx}#{}", sup.short_name()),
                             source_node: sub_node.clone(),
                             source_port: None,
-                            target_node: sup_node.clone(),
+                            target_node: sup_node,
                             target_port: None,
                             kind: RelationshipKind::Specialization,
                             label: Some(":>".to_string()),
@@ -4835,6 +4922,12 @@ fn resolve_trace_target_context(
         segments[1..].join(".")
     } else if segments.len() == 2 {
         segments.join(".")
+    } else if let Some((pkg_and_parent, leaf)) = head.rsplit_once("::") {
+        if let Some((_, parent_pkg)) = pkg_and_parent.rsplit_once("::") {
+            format!("{parent_pkg}::{leaf}")
+        } else {
+            head_short.to_string()
+        }
     } else {
         head_short.to_string()
     };
@@ -4913,6 +5006,51 @@ fn resolve_trace_target_context(
         stereotype: default_stereo,
         source_file: fallback_file.to_string(),
         span: syssur_model::Span::new(fallback_file, 0, 0),
+    }
+}
+
+fn sysml_metaclass_for_generic(kind: SysmlElementKind, is_def: bool) -> &'static str {
+    match (kind, is_def) {
+        (SysmlElementKind::Constraint, true) => "ConstraintDefinition",
+        (SysmlElementKind::Constraint, false) => "ConstraintUsage",
+        (SysmlElementKind::Concern, true) => "ConcernDefinition",
+        (SysmlElementKind::Concern, false) => "ConcernUsage",
+        (SysmlElementKind::UseCase, true) => "UseCaseDefinition",
+        (SysmlElementKind::UseCase, false) => "UseCaseUsage",
+        (SysmlElementKind::AnalysisCase, true) => "AnalysisCaseDefinition",
+        (SysmlElementKind::AnalysisCase, false) => "AnalysisCaseUsage",
+        (SysmlElementKind::VerificationCase, true) => "VerificationCaseDefinition",
+        (SysmlElementKind::VerificationCase, false) => "VerificationCaseUsage",
+        (SysmlElementKind::Case, true) => "CaseDefinition",
+        (SysmlElementKind::Case, false) => "CaseUsage",
+        (SysmlElementKind::Item, true) => "ItemDefinition",
+        (SysmlElementKind::Item, false) => "ItemUsage",
+        (SysmlElementKind::Attribute, true) => "AttributeDefinition",
+        (SysmlElementKind::Attribute, false) => "AttributeUsage",
+        (SysmlElementKind::Enum, true) => "EnumerationDefinition",
+        (SysmlElementKind::Enum, false) => "EnumerationUsage",
+        (SysmlElementKind::Occurrence, true) => "OccurrenceDefinition",
+        (SysmlElementKind::Occurrence, false) => "OccurrenceUsage",
+        (SysmlElementKind::Calc, true) => "CalculationDefinition",
+        (SysmlElementKind::Calc, false) => "CalculationUsage",
+        (SysmlElementKind::Interface, true) => "InterfaceDefinition",
+        (SysmlElementKind::Interface, false) => "InterfaceUsage",
+        (SysmlElementKind::Viewpoint, true) => "ViewpointDefinition",
+        (SysmlElementKind::Viewpoint, false) => "ViewpointUsage",
+        (SysmlElementKind::Rendering, true) => "RenderingDefinition",
+        (SysmlElementKind::Rendering, false) => "RenderingUsage",
+        (SysmlElementKind::Metadata, true) => "MetadataDefinition",
+        (SysmlElementKind::Metadata, false) => "MetadataUsage",
+        (SysmlElementKind::Allocation, true) => "AllocationDefinition",
+        (SysmlElementKind::Allocation, false) => "AllocationUsage",
+        (SysmlElementKind::Connection, true) => "ConnectionDefinition",
+        (SysmlElementKind::Connection, false) => "ConnectionUsage",
+        (SysmlElementKind::Flow, true) => "FlowConnectionDefinition",
+        (SysmlElementKind::Flow, false) => "FlowConnectionUsage",
+        (SysmlElementKind::Comment, _) => "Comment",
+        (SysmlElementKind::Alias, _) => "Alias",
+        (SysmlElementKind::Filter, _) => "Filter",
+        _ => "Element",
     }
 }
 
@@ -6590,6 +6728,306 @@ mod tests {
                 .filter(|e| e.kind == RelationshipKind::Verify)
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn air_compressor_definitions_view_shows_all_component_defs_without_stray_duplicates() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "components.sysml".into(),
+            r#"package CompressorComponents {
+    private import ScalarValues::*;
+    part def PowerSupply { attribute ratedPower : Real default = 2200.0; }
+    part def Controller { attribute shutdownDuration : Real default = 0.25; }
+    part def Motor;
+    part def Pump;
+    part def Tank;
+    part def Sensor { attribute accuracy : Real default = 0.01; }
+    part def PressureSensor :> Sensor;
+    part def TemperatureSensor :> Sensor { attribute temperature : Real default = 293.15; }
+    part def Valve;
+    part def CheckValve :> Valve;
+    part def ReliefValve :> Valve;
+    part def CoolingFan { attribute ratedPower : Real default = 120.0; }
+    part def CoolingAssembly {
+        part fan : CoolingFan;
+        part temperature : TemperatureSensor;
+    }
+    part def ServiceConsole;
+    part def CompressorInterface;
+    part def Operator;
+    part def Technician;
+    part def AirTool;
+}"#
+            .into(),
+        );
+        files.insert(
+            "system.sysml".into(),
+            r#"package CompressorSystem {
+    private import CompressorComponents::*;
+    part def Compressor {
+        part cooling : CoolingAssembly;
+    }
+    part def Workshop {
+        part compressor : Compressor;
+        part spareCompressor : Compressor;
+    }
+    part workshop : Workshop;
+}"#
+            .into(),
+        );
+        files.insert(
+            "views.sysml".into(),
+            r#"package CompressorViews {
+    private import StandardViewDefinitions::*;
+    view def Definitions :> GeneralView {
+        filter @SysML::PartDefinition or @SysML::PartUsage;
+    }
+    view definitions : Definitions { expose CompressorComponents::**; }
+}"#
+            .into(),
+        );
+
+        let parsed = SysmlEngine::parse_workspace(&files);
+        let defs_view = &parsed.graph.views[&ElementId::new("CompressorViews::definitions")];
+        let (base_input, meta) = build_layout_input_for_view(
+            &parsed.graph,
+            &ViewScope::SysmlView(defs_view.id.clone()),
+            defs_view.kind,
+            LayoutDirection::TopToBottom,
+        );
+        let layout = syssur_layout::compute_deterministic_layout(&base_input);
+
+        assert!(
+            layout.nodes.contains_key("CompressorComponents::CoolingFan"),
+            "explicitly exposed CoolingFan part def must be shown"
+        );
+        assert!(
+            layout
+                .nodes
+                .contains_key("CompressorComponents::TemperatureSensor"),
+            "explicitly exposed TemperatureSensor part def must be shown"
+        );
+        let fan_count = layout
+            .nodes
+            .keys()
+            .filter(|k| k.ends_with("::fan"))
+            .count();
+        assert_eq!(
+            fan_count, 1,
+            "expected only CoolingAssembly::fan, no stray workshop copies; keys={:?}",
+            layout.nodes.keys().collect::<Vec<_>>()
+        );
+
+        let spec_edges: Vec<_> = layout
+            .edges
+            .iter()
+            .filter(|e| e.kind == RelationshipKind::Specialization)
+            .collect();
+        assert_eq!(
+            spec_edges.len(),
+            4,
+            "expected 4 specialization edges (PressureSensor, TemperatureSensor, CheckValve, ReliefValve)"
+        );
+
+        let top_keys: Vec<_> = base_input
+            .nodes
+            .iter()
+            .filter(|n| n.parent.is_none())
+            .map(|n| n.path.canonical_key())
+            .collect();
+        for i in 0..top_keys.len() {
+            for j in (i + 1)..top_keys.len() {
+                let a = layout.nodes[&top_keys[i]].rect;
+                let b = layout.nodes[&top_keys[j]].rect;
+                let sep_x = a.x + a.w <= b.x || b.x + b.w <= a.x;
+                let sep_y = a.y + a.h <= b.y || b.y + b.h <= a.y;
+                assert!(
+                    sep_x || sep_y,
+                    "top-level nodes {} ({a:?}) and {} ({b:?}) overlap! meta_a={:?}",
+                    top_keys[i],
+                    top_keys[j],
+                    meta.get(&top_keys[i]).map(|m| &m.stereotype)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn requirements_view_filter_hides_unfiltered_part_defs_and_links_typed_by() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "model.sysml".into(),
+            r#"package CapacityRequirements {
+    part def Tank {
+        attribute capacity : ScalarValues::Real;
+    }
+    part storage : Tank {
+        attribute :>> capacity = 20.0;
+    }
+    requirement def <'REQ-1'> MinimumCapacity {
+        doc /* The storage tank shall have capacity of at least ten units. */
+        subject tank : Tank;
+    }
+    requirement <'REQ-1.1'> usableCapacity : MinimumCapacity;
+    satisfy usableCapacity by storage;
+}"#
+            .into(),
+        );
+        files.insert(
+            "views.sysml".into(),
+            r#"package CapacityViews {
+    private import StandardViewDefinitions::*;
+    view requirements : GeneralView {
+        filter @SysML::RequirementDefinition or @SysML::RequirementUsage;
+        expose CapacityRequirements::**;
+    }
+}"#
+            .into(),
+        );
+
+        let parsed = SysmlEngine::parse_workspace(&files);
+        let view = &parsed.graph.views[&ElementId::new("CapacityViews::requirements")];
+        let (base_input, _) = build_layout_input_for_view(
+            &parsed.graph,
+            &ViewScope::SysmlView(view.id.clone()),
+            view.kind,
+            LayoutDirection::TopToBottom,
+        );
+        let layout = syssur_layout::compute_deterministic_layout(&base_input);
+
+        assert!(
+            !layout.nodes.contains_key("CapacityRequirements::Tank"),
+            "part def Tank must be filtered out by @SysML::RequirementDefinition or @SysML::RequirementUsage"
+        );
+        assert!(layout
+            .nodes
+            .contains_key("CapacityRequirements::MinimumCapacity"));
+        assert!(layout
+            .nodes
+            .contains_key("CapacityRequirements::usableCapacity"));
+        assert!(layout
+            .nodes
+            .contains_key("CapacityRequirements::storage"));
+        assert!(layout
+            .edges
+            .iter()
+            .any(|e| e.kind == RelationshipKind::Satisfy && e.label.as_deref() == Some("«satisfy»")));
+        assert!(layout
+            .edges
+            .iter()
+            .any(|e| e.kind == RelationshipKind::Specialization && e.label.as_deref() == Some("typed by")));
+    }
+
+    #[test]
+    fn requirements_traceability_resolves_alias_negated_satisfy_and_package_targets() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "system.sysml".into(),
+            r#"package TraceSystem {
+    part def Tank { attribute capacity : ScalarValues::Real; }
+    package LeftPlant {
+        part tank : Tank { attribute :>> capacity = 20.0; }
+    }
+    package RightPlant {
+        part tank : Tank { attribute :>> capacity = 30.0; }
+    }
+    part spare : Tank { attribute :>> capacity = 40.0; }
+}"#
+            .into(),
+        );
+        files.insert(
+            "requirements.sysml".into(),
+            r#"package TraceRequirements {
+    private import TraceSystem::*;
+    requirement def <'REQ-CAP'> MinimumCapacity {
+        doc /* The storage tank shall provide at least ten units. */
+        subject tank : Tank;
+    }
+    alias CapacityRule for MinimumCapacity;
+    requirement <'REQ-LEFT'> leftSpecification {
+        doc /* Capacity requirements for the left installation. */
+        subject installation : Tank;
+        requirement <'REQ-LEFT-CAP'> leftCapacity : CapacityRule {
+            subject tank = TraceSystem::LeftPlant::tank;
+        }
+    }
+    requirement <'REQ-RIGHT'> rightSpecification {
+        doc /* Capacity requirements for the right installation. */
+        subject installation : Tank;
+        requirement <'REQ-RIGHT-CAP'> rightCapacity : CapacityRule {
+            subject tank = TraceSystem::RightPlant::tank;
+        }
+    }
+    requirement <'REQ-UNLINKED'> unlinkedCapacity : MinimumCapacity;
+    requirement <'REQ-EXCLUDED'> excludedCapacity : MinimumCapacity;
+    assert not satisfy excludedCapacity by TraceSystem::spare;
+    satisfy leftSpecification.leftCapacity by TraceSystem::LeftPlant::tank;
+    satisfy rightSpecification.rightCapacity by TraceSystem::RightPlant::tank;
+}"#
+            .into(),
+        );
+        files.insert(
+            "views.sysml".into(),
+            r#"package TraceViews {
+    private import StandardViewDefinitions::*;
+    view requirements : GeneralView {
+        filter @SysML::RequirementDefinition or @SysML::RequirementUsage;
+        expose TraceRequirements::MinimumCapacity;
+        expose TraceRequirements::leftSpecification;
+        expose TraceRequirements::rightSpecification;
+        expose TraceRequirements::unlinkedCapacity;
+        expose TraceRequirements::excludedCapacity;
+        expose TraceRequirements::leftSpecification::leftCapacity;
+        expose TraceRequirements::rightSpecification::rightCapacity;
+    }
+}"#
+            .into(),
+        );
+
+        let parsed = SysmlEngine::parse_workspace(&files);
+        let view = &parsed.graph.views[&ElementId::new("TraceViews::requirements")];
+        let (base_input, meta) = build_layout_input_for_view(
+            &parsed.graph,
+            &ViewScope::SysmlView(view.id.clone()),
+            view.kind,
+            LayoutDirection::TopToBottom,
+        );
+        let layout = syssur_layout::compute_deterministic_layout(&base_input);
+
+        assert!(layout
+            .nodes
+            .values()
+            .any(|n| n.label == "LeftPlant::tank"));
+        assert!(layout
+            .nodes
+            .values()
+            .any(|n| n.label == "RightPlant::tank"));
+        assert!(meta
+            .values()
+            .any(|m| m.short_id.as_deref() == Some("REQ-LEFT-CAP")));
+        assert!(layout
+            .edges
+            .iter()
+            .any(|e| e.kind == RelationshipKind::Satisfy
+                && e.label.as_deref() == Some("«assert not satisfy»")));
+        assert_eq!(
+            layout
+                .edges
+                .iter()
+                .filter(|e| e.kind == RelationshipKind::Composition)
+                .count(),
+            2
+        );
+        assert_eq!(
+            layout
+                .edges
+                .iter()
+                .filter(|e| e.kind == RelationshipKind::Specialization
+                    && e.label.as_deref() == Some("typed by"))
+                .count(),
+            4
         );
     }
 }

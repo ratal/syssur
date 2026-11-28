@@ -328,6 +328,7 @@ mod tests {
                     requirement: ElementId::new("PowerBudgetReq"),
                     target: "nominalRover.powertrain".into(),
                     is_asserted: false,
+                    is_negated: false,
                     span: Span::new("vehicle.sysml", 0, 10),
                 }],
             )

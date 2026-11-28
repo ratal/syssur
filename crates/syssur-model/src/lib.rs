@@ -437,6 +437,8 @@ pub struct TraceLink {
     pub target: String,
     #[serde(default)]
     pub is_asserted: bool,
+    #[serde(default)]
+    pub is_negated: bool,
     pub span: Span,
 }
 
@@ -449,6 +451,8 @@ pub struct ViewDef {
     pub base_views: Vec<ElementId>,
     pub is_usage: bool,
     pub expose_patterns: Vec<String>,
+    #[serde(default)]
+    pub element_filters: Vec<String>,
     pub include_relationships: Vec<RelationshipKind>,
     pub span: Span,
 }
@@ -538,15 +542,39 @@ impl DefinitionGraph {
             .find(|st| st.name == short || st.id.as_str().ends_with(&format!("::{short}")))
     }
 
-    /// Looks up a `RequirementNode` by exact `ElementId` or unique short name.
+    /// Looks up a `RequirementNode` by exact `ElementId`, unique short name, or alias.
     pub fn resolve_requirement(&self, target: &ElementId) -> Option<&RequirementNode> {
-        if let Some(found) = self.requirements.get(target) {
-            return Some(found);
+        let mut cur = target.clone();
+        for _ in 0..4 {
+            if let Some(found) = self.requirements.get(&cur) {
+                return Some(found);
+            }
+            let short = cur.short_name();
+            if let Some(found) = self
+                .requirements
+                .values()
+                .find(|req| req.name == short || req.id.as_str().ends_with(&format!("::{short}")))
+            {
+                return Some(found);
+            }
+            let next_alias = self
+                .generic_elements
+                .get(&cur)
+                .filter(|e| e.kind == SysmlElementKind::Alias)
+                .or_else(|| {
+                    self.generic_elements.values().find(|e| {
+                        e.kind == SysmlElementKind::Alias
+                            && (e.name == short || e.id.as_str().ends_with(&format!("::{short}")))
+                    })
+                })
+                .and_then(|e| e.type_ref.as_ref())
+                .cloned();
+            match next_alias {
+                Some(next) if next != cur => cur = next,
+                _ => break,
+            }
         }
-        let short = target.short_name();
-        self.requirements
-            .values()
-            .find(|req| req.name == short || req.id.as_str().ends_with(&format!("::{short}")))
+        None
     }
 
     /// Looks up a `PortDef` by exact `ElementId` or unique short name.
@@ -938,6 +966,8 @@ impl InstanceNode {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ViewFilter {
     pub expose_patterns: Vec<String>,
+    #[serde(default)]
+    pub element_filters: Vec<String>,
     pub include_relationships: Vec<RelationshipKind>,
 }
 
@@ -965,6 +995,34 @@ impl ViewFilter {
                 qn == pattern || qn.ends_with(&format!("::{pattern}"))
             }
         })
+    }
+
+    pub fn allows_metaclass(&self, metaclass: &str) -> bool {
+        if self.element_filters.is_empty() {
+            return true;
+        }
+        if self.element_filters.iter().any(|f| f == "false") {
+            return false;
+        }
+        let sysml_tokens: Vec<&str> = self
+            .element_filters
+            .iter()
+            .filter_map(|f| {
+                if let Some(rest) = f.strip_prefix("SysML::") {
+                    Some(rest)
+                } else if f.ends_with("Definition") || f.ends_with("Usage") {
+                    Some(f.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if sysml_tokens.is_empty() {
+            return true;
+        }
+        sysml_tokens
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(metaclass))
     }
 
     pub fn allows_relationship(&self, kind: RelationshipKind) -> bool {
@@ -1040,6 +1098,7 @@ mod tests {
     fn view_filter_matches_recursive_and_direct_expose() {
         let filter = ViewFilter {
             expose_patterns: vec!["Power::**".into(), "RoverSystem::*".into()],
+            element_filters: vec![],
             include_relationships: vec![RelationshipKind::Connection],
         };
         assert!(filter.matches_element(&ElementId::new("Power::BatteryPack::powerOut")));
@@ -1050,6 +1109,7 @@ mod tests {
 
         let rel_filter = ViewFilter {
             expose_patterns: vec!["PartsTree::**".into()],
+            element_filters: vec![],
             include_relationships: vec![],
         };
         assert!(rel_filter.matches_element(&ElementId::new(
@@ -1057,6 +1117,7 @@ mod tests {
         )));
         let direct_rel = ViewFilter {
             expose_patterns: vec!["PartsTree::*".into()],
+            element_filters: vec![],
             include_relationships: vec![],
         };
         assert!(direct_rel.matches_element(&ElementId::new(
